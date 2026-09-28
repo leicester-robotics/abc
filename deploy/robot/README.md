@@ -61,3 +61,9 @@ KeyListener forwards pedal key-down/up edges (autorepeat is dropped so held
 pedals don't re-fire toggles); `FOOT_PEDAL_INPUT_KEY` overrides the
 forwarded key set (default `a,b,c,x,j`); launchers resolve the device via
 `deploy/robot/key_listeners/pedal.py`.
+
+## Measured passive GELLO simulation
+
+The migrated 2 Mbps station calibration and simulation workflow is in
+[`deploy/gello/TELEOP.md`](../gello/TELEOP.md). It reuses ABC simulation physics;
+the real-robot launchers above still use their existing leader driver.

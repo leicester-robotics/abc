@@ -15,3 +15,7 @@ wandb/
 # Robot recordings, review videos, and exports (deploy/).
 data/
 .python-version
+
+# Station measurements and GELLO runtime logs stay local.
+deploy/gello/calibrations/
+.pytest_cache/

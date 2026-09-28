@@ -1,5 +1,8 @@
 # GELLO
 
+For the migrated dual-arm simulation teleop, see [TELEOP.md](TELEOP.md).
+The existing real-robot stack is documented in [robot/README.md](../robot/README.md).
+
 ![Assembled GELLO render](gello.jpg)
 
 [Assembly guide](GELLO_assembly.pdf)

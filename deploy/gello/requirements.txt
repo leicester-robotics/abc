@@ -1,0 +1,5 @@
+# Standalone GELLO simulation; no training or physical follower dependencies.
+numpy
+mujoco~=3.8.0
+dynamixel-sdk>=3.7,<5
+gymnasium>=1.1

@@ -60,6 +60,10 @@ include = ["abc_minimal*", "abc_sim*", "deploy*"]
 
 [tool.setuptools.package-data]
 abc_sim = ["models/*.xml", "models/assets_manifest.json"]
+"deploy.gello" = [
+    "assets/yam/*.xml", "assets/yam/*.txt", "assets/yam/assets/*.stl",
+    "assets/abc_box/*.xml", "assets/abc_box/*.txt",
+]
 
 [tool.uv.sources]
 torch = { index = "pytorch-cu128" }
