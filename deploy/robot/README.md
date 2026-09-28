@@ -61,3 +61,9 @@ KeyListener forwards pedal key-down/up edges (autorepeat is dropped so held
 pedals don't re-fire toggles); `FOOT_PEDAL_INPUT_KEY` overrides the
 forwarded key set (default `a,b,c,x,j`); launchers resolve the device via
 `deploy/robot/key_listeners/pedal.py`.
+
+## Headless GELLO dashboard
+
+See [dashboard setup](../dashboard/README.md) for browser-based MuJoCo teleop,
+raw GELLO data, RealSense streams, and SSH port forwarding. Physical YAM control
+is locked pending driver lifecycle verification; simulation opens no YAM controller.

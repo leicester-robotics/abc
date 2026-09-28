@@ -1,11 +1,12 @@
 import unittest
+import os
 from pathlib import Path
 import numpy as np
 from deploy.dashboard.simulation import Simulation
 from deploy.dashboard.samples import LeaderSample
 
 MODEL=Path('abc_sim/models/yam_bimanual_empty.xml')
-ASSETS=Path('/home/tarik/code/abc/abc_sim/models/assets/i2rt_yam/assets')
+ASSETS=Path(os.environ.get('DASHBOARD_TEST_ASSETS', '/home/tarik/code/abc/abc_sim/models/assets/i2rt_yam/assets'))
 
 class SimulationTests(unittest.TestCase):
     def setUp(self): self.sim=Simulation(MODEL,asset_dir=ASSETS)

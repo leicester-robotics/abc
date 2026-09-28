@@ -1,0 +1,7 @@
+numpy
+mujoco~=3.8.0
+mjviser
+viser
+pyrealsense2; sys_platform == 'linux'
+dynamixel-sdk
+pyzmq
