@@ -6,13 +6,16 @@ Control table: https://emanual.robotis.com/docs/en/dxl/x/xl330-m288/
 from dataclasses import dataclass
 import numpy as np
 
-CAP_MA=25
+CAP_MA=75
+CURRENT_RAMP_MA_PER_SECOND=150.
 
 @dataclass
 class HapticTarget:
     acquired_at: float
     current_ma: np.ndarray
     enabled: bool = True
+    hold_percent: float = 0.
+    yield_degrees: float = 6.
 
 
 def reflected_current(arm,sample,now,strength=.3):
@@ -23,7 +26,7 @@ def reflected_current(arm,sample,now,strength=.3):
     grip_direction=sample.raw.get('gripper_direction')
     if grip_direction not in (-1,1):return None
     effort[-1]*=grip_direction
-    return np.clip(-np.asarray(arm.signs)*effort*5.*np.clip(strength,0,1),-CAP_MA,CAP_MA)
+    return np.clip(-np.asarray(arm.signs)*effort*50.*np.clip(strength,0,1),-CAP_MA,CAP_MA)
 
 
 class HapticOutput:
@@ -43,6 +46,10 @@ class HapticOutput:
         packet=self.connection.packetHandler
         method=packet.write1ByteTxRx if size==1 else packet.write2ByteTxRx
         result,error=method(self.connection.portHandler,motor,address,int(value)&((1<<(8*size))-1))
+        # Goal-current writes are idempotent. A missing acknowledgment does not
+        # establish whether the first write arrived; repeat the same value once.
+        if address==102 and size==2 and result==-3001 and error==0:
+            result,error=method(self.connection.portHandler,motor,address,int(value)&0xffff)
         if result or error:raise ConnectionError(f'GELLO {motor} write {address}: {result}/{error}')
 
     def enable(self):

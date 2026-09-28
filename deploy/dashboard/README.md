@@ -64,11 +64,16 @@ Create `outputs/dashboard/` first if needed. View output with
 `tmux attach -t gello-dashboard` and press Ctrl-C. This allows camera and serial
 handles to close. A later launch starts in simulation mode again.
 
+Fault details appear above the tabs with the original error, time, control stage,
+plain-language explanation, and recovery instructions. Later failed button clicks
+do not overwrite the recorded fault. The same record is available in status.json.
+
 ## Dashboard layout
 
 - **Simulation:** robot view, preview/reset, and physical-control status.
 - **Cameras:** live RGB/depth previews; this tab enables image transmission.
 - **Arm data:** wide panel with GELLO / MuJoCo / Physical YAM tabs and Left / Right selectors.
+- **Teleop settings:** live GELLO/alignment margins, heartbeat deadline, speeds, and force-feedback strength. Apply validates the whole edit; active control belongs to one browser. Settings are per session and reset on restart.
 - **Setup:** calibration, adapter identities, and physical-control lock details.
 
 ## Use simulation
@@ -117,16 +122,25 @@ The shared installed SDK is unchanged. An unverified SDK keeps physical control 
 4. **Simulation only** stops following and holds the physical arms.
    **Release robot** disables their motors.
 
-Force feedback defaults on and activates only during teleop. It reflects measured
-motor effort, including gravity and friction, with a 25 mA per-motor hardware cap,
-current ramping, a 100 ms freshness deadline, and a motor bus watchdog. The serial
+Force feedback defaults on and activates only during teleop. GELLO compliant hold
+also defaults on: a current-limited spring resists displacement and moves its
+anchor after the configured yield distance (default 6 degrees). It holds within
+the available 75 mA combined current cap and can sag under heavier loads. It
+is not gravity compensation. Hold strength and yield distance are adjustable
+in Teleop settings; zero strength disables hold. The gripper is excluded.
+Faults, stale data, or stopping teleop release leader hold. It reflects measured
+motor effort, including gravity and friction, with a 75 mA per-motor hardware cap,
+15 mA/Nm default reflection gain, a 150 mA/s current ramp, a 100 ms freshness deadline, and a motor bus watchdog. The serial
 reader owns all leader writes and restores mode/current limits after disabling.
 This has offline coverage; physical haptic behavior still needs operator validation.
 
-The controller holds on stale feedback, loss of the 500 ms browser lease, or a
+GELLO joint targets allow 5 degrees of overtravel and clamp to the robot limits;
+physical feedback has a separate 0.03 rad stop-error allowance.
+The controller holds on stale feedback, loss of the 1 second browser lease, or a
 moving leader during alignment. Startup does not enable following automatically.
 Gripper calibration holds the arm joints and checks both endpoints against the
 station's observed 4.5–6.0 rad travel range (historical station-shadow reports).
+The measured closed stop maps to zero; no 5% overtravel offset is added to calibration.
 
 Physical YAM telemetry comes from complete motor batches while connected, or
 existing follower ZMQ observations while disconnected.
@@ -180,7 +194,10 @@ continues at 30 fps. This reduces tunnel traffic when using the simulation.
 
 These settings may reset after reconnect/reboot. The reader uses sync reads when
 available and falls back to checked per-servo reads when sync transfers fail.
-Raw telemetry reports read mode and acquisition duration. It retains the oldest
+Encoder packet timeouts retry on the existing serial connection. Teleop can use
+the last complete sample for up to 200 ms; partial batches never refresh its age.
+A missed batch zeros active leader feedback. Hardware and haptic-write errors
+remain fatal. Raw telemetry reports read mode and acquisition duration. It retains the oldest
 sample acquisition time so a slow batch cannot look artificially fresh.
 
 ## Verification

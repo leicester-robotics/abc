@@ -4,27 +4,37 @@ import queue
 import threading
 import time
 import numpy as np
+from .settings import TeleopSettings
 
 
 LOW = np.array([-2.617, 0., 0., -1.57, -1.57, -2.09, 0.])
 HIGH = np.array([3.13, 3.65, 3.13, 1.57, 1.57, 2.09, 1.])
 
 
-def checked(sample, now):
+def checked(sample, now, observation=False, leader_margin_deg=5.):
     if sample is None or not np.isfinite(sample.acquired_at) or not 0 <= now-sample.acquired_at <= .2:
         raise ValueError('Feedback missing or older than 200 ms')
     q = np.asarray(sample.position, dtype=float)
     if q.shape != (7,) or not np.isfinite(q).all():
         raise ValueError('Expected seven finite joint values')
-    # Allow 0.01 rad encoder noise at a stop, but never command beyond the limits.
-    tolerance = np.array([.01]*6+[0.])
+    # Allow 5 degrees of leader overtravel and 0.03 rad physical stop error.
+    # Commands remain clipped to the robot limits.
+    tolerance = np.array([.03 if observation else np.deg2rad(leader_margin_deg)]*6+[0.])
     if np.any(q < LOW-tolerance) or np.any(q > HIGH+tolerance):
-        raise ValueError('Joint target or observation exceeds limits')
+        bad=np.flatnonzero((q < LOW-tolerance) | (q > HIGH+tolerance))
+        details=', '.join(f'{"gripper" if i==6 else "joint "+str(i+1)}={q[i]:.5f} (range {LOW[i]:.3f}..{HIGH[i]:.3f}, tolerance {tolerance[i]:.3f})' for i in bad)
+        raise ValueError('Joint target or observation exceeds limits: '+details)
     return np.clip(q, LOW, HIGH)
+
+
+BROWSER_LEASE_SECONDS = 1.0
 
 
 class ControlSupervisor:
     def __init__(self, arms, leaders, adapter_factory, clock=time.monotonic, require_support=False, home_on_connect=False, haptics=None, home_pose=None):
+        self.settings = TeleopSettings()
+        self.settings_error = ''
+        self.settings_revision = 0
         self.haptics = haptics or {}
         self.force_feedback = True
         self.home_pose = home_pose
@@ -41,6 +51,7 @@ class ControlSupervisor:
         self.mode = 'simulation'
         self.owner = None
         self.error = ''
+        self.last_fault = None
         self.adapters = {}
         self.observations = {}
         self.targets = {}
@@ -68,6 +79,9 @@ class ControlSupervisor:
         except queue.Full:
             pass  # Stop requests use a separate latched event and cannot be dropped.
 
+    def request_settings(self, values, client_id):
+        self.request(('settings',dict(values)),client_id)
+
     def heartbeat(self, client_id, now):
         with self._heartbeat_lock:
             self._heartbeats[str(client_id)] = now
@@ -80,17 +94,29 @@ class ControlSupervisor:
     def _lease_valid(self, client, now):
         with self._heartbeat_lock:
             age = now-self._heartbeats.get(client, -float('inf'))
-        return 0 <= age <= .5
+        return 0 <= age <= self.settings.heartbeat_seconds
 
     def _leader(self, arm, now):
         if not arm.mapping_verified or not arm.calibrated:
             raise ValueError(f'{arm.side}: verify side, signs, and calibration first')
         sample = self.leaders[arm.side].read()
-        if self.leaders[arm.side].error or sample is None or not sample.calibrated:
+        if self.leaders[arm.side].error and not self.leaders[arm.side].transient_error:
+            raise ValueError(f'{arm.side}: {self.leaders[arm.side].error}')
+        if sample is None or not sample.calibrated:
             raise ValueError(f'{arm.side}: GELLO unavailable or uncalibrated')
-        return checked(sample, now)
+        try:
+            return checked(sample, now, leader_margin_deg=self.settings.leader_margin_deg)
+        except ValueError as error:
+            raise ValueError(f'{arm.side} GELLO: {error}') from error
+
+    def _remember_fault(self, reason, stage=None):
+        if self.mode=='fault' and self.last_fault is not None:return
+        from datetime import datetime
+        self.last_fault={'reason':reason,'time':datetime.now().astimezone().isoformat(timespec='seconds'),
+                         'stage':stage or self.mode}
 
     def _hold(self, now, fault=False, reason=''):
+        if fault:self._remember_fault(reason)
         self.owner = None
         self._generation += 1
         self.mode = 'fault' if fault else 'holding' if self.adapters else 'simulation'
@@ -103,7 +129,7 @@ class ControlSupervisor:
             try:
                 sample = adapter.observe()
                 try:
-                    target = checked(sample, now).copy()
+                    target = checked(sample, now, observation=True).copy()
                 except ValueError:
                     target = self.targets.get(side)
                     self.mode = 'fault'
@@ -116,6 +142,15 @@ class ControlSupervisor:
                 self.error = f'Stop cannot be confirmed: {error}'
 
     def _action(self, action, client, now):
+        if isinstance(action,tuple) and action[0]=='settings':
+            try:
+                if self.owner is not None and client!=self.owner:
+                    raise ValueError('Only the controlling browser can change teleop settings')
+                self.settings=self.settings.updated(action[1])
+                self.settings_revision+=1
+                self.settings_error=''
+            except ValueError as error:self.settings_error=str(error)
+            return
         if action in ('haptics_on','haptics_off'):
             if self.owner is not None and client != self.owner:
                 raise ValueError('Only the controlling browser can change force feedback')
@@ -145,7 +180,7 @@ class ControlSupervisor:
             if self.mode != 'fault':
                 return
             for adapter in self.adapters.values():
-                checked(adapter.observe(), now)
+                checked(adapter.observe(), now, observation=True)
             self._hold(now)
             return
         if action == 'connect':
@@ -166,12 +201,16 @@ class ControlSupervisor:
                     adapter = self.adapter_factory(arm)
                     self.adapters[arm.side] = adapter
                     adapter.connect()
-                    q = checked(adapter.observe(), self.clock())
+                    try:
+                        q = checked(adapter.observe(), self.clock(), observation=True)
+                    except Exception as error:
+                        raise ValueError(f'{arm.side} YAM startup: {error}') from error
                     adapter.hold(q)
                     self.targets[arm.side] = q.copy()
                 self.mode = 'holding'
                 self.error = ''
-            except Exception:
+            except Exception as error:
+                self._remember_fault(str(error),stage='connecting')
                 self._close_adapters()
                 self.mode = 'fault'
                 raise
@@ -196,12 +235,12 @@ class ControlSupervisor:
             if not follow and self.home_pose is not None:
                 from .samples import ArmSample
                 target = checked(ArmSample(now,np.asarray(self.home_pose)),now)
-            actual = checked(self.adapters[arm.side].observe(), now)
+            actual = checked(self.adapters[arm.side].observe(), now, observation=True)
             alignment_goals[arm.side] = target.copy()
             delta = np.abs(target-actual)
             self.alignment[arm.side] = delta.tolist()
             self.targets[arm.side] = actual.copy()
-            needs_alignment = needs_alignment or np.any(delta > .03)
+            needs_alignment = needs_alignment or np.any(delta > self.settings.alignment_tolerance())
         self.owner = client
         self._leader_at_alignment = leader_at_alignment
         self._alignment_goals = alignment_goals
@@ -241,9 +280,9 @@ class ControlSupervisor:
             try:
                 sample = adapter.observe()
                 self.observations[side] = sample
-                checked(sample, now)
+                checked(sample, now, observation=True)
             except Exception as error:
-                self._hold(now, fault=True, reason=str(error))
+                self._hold(now, fault=True, reason=f'{side} YAM: {error}')
                 break
         if self.mode in ('aligning','teleop'):
             try:
@@ -255,13 +294,13 @@ class ControlSupervisor:
                         self._publish()
                         return
                     goals = self._alignment_goals
-                speed = .25 if self.mode == 'aligning' else .5
+                speed = self.settings.alignment_speed if self.mode == 'aligning' else self.settings.teleop_speed
                 for side, goal in goals.items():
                     target = self.targets[side]+np.clip(goal-self.targets[side], -speed*dt, speed*dt)
                     self.adapters[side].command(target)
                     self.targets[side] = target.copy()
                     self.alignment[side] = np.abs(goal-self.observations[side].position).tolist()
-                if self.mode == 'aligning' and all(np.max(delta)<=.03 for delta in self.alignment.values()):
+                if self.mode == 'aligning' and all(np.all(np.asarray(delta)<=self.settings.alignment_tolerance()) for delta in self.alignment.values()):
                     self.mode = self._alignment_then
                     if self.mode == 'holding':self.owner = None
             except Exception as error:
@@ -273,11 +312,17 @@ class ControlSupervisor:
         now=self.clock()
         for arm in self.arms:
             if arm.side not in self.haptics:continue
-            current=reflected_current(arm,self.observations.get(arm.side),now) if self.mode=='teleop' and self.force_feedback else None
-            self.haptics[arm.side].publish(HapticTarget(now if current is None else self.observations[arm.side].acquired_at,np.zeros(7) if current is None else current,enabled=current is not None))
+            current=reflected_current(arm,self.observations.get(arm.side),now,strength=.3*self.settings.feedback_percent/100.) if self.mode=='teleop' and self.force_feedback else None
+            observation=self.observations.get(arm.side)
+            hold=self.settings.hold_percent if self.mode=='teleop' and observation is not None and 0<=now-observation.acquired_at<=.1 else 0.
+            enabled=current is not None or hold>0
+            self.haptics[arm.side].publish(HapticTarget(observation.acquired_at if enabled else now,
+                np.zeros(7) if current is None else current,enabled=enabled,
+                hold_percent=hold,yield_degrees=self.settings.hold_yield_deg))
         import copy
         with self._status_lock:
-            self._published = copy.deepcopy(dict(mode=self.mode, owner=self.owner, error=self.error,
+            self._published = copy.deepcopy(dict(mode=self.mode, owner=self.owner, error=self.error, last_fault=self.last_fault,
+                settings=self.settings.as_dict(),settings_error=self.settings_error,settings_revision=self.settings_revision,
                 observations=self.observations, targets=self.targets, alignment=self.alignment,force_feedback=self.force_feedback))
 
     def status(self):
@@ -309,6 +354,7 @@ class ControlSupervisor:
                 del self.adapters[side]
         self._release_uncertain = bool(errors)
         if errors:
+            self._remember_fault('Robot release not confirmed: '+ '; '.join(errors))
             self.mode = 'fault'
             self.owner = None
             self.error = 'Robot release not confirmed: '+ '; '.join(errors)

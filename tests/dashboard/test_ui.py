@@ -33,3 +33,10 @@ class UITests(unittest.TestCase):
         self.assertIn('0.125',text)
         self.assertIn('50.0 Hz',text)
         self.assertIn('Alignment',text)
+
+    def test_fault_panel_explains_current_write_timeout_and_keeps_original(self):
+        from deploy.dashboard.ui import format_fault
+        text=format_fault({'mode':'fault','error':'Confirm arms supported',
+            'last_fault':{'reason':'right: GELLO 5 write 102: -3001/0','time':'2026-09-28T12:00:00','stage':'teleop'}})
+        for expected in ['right','GELLO 5','acknowledgment','Current message','2026-09-28','Clear fault']:
+            self.assertIn(expected,text)

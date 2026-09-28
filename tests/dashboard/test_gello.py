@@ -145,3 +145,84 @@ class GelloTests(unittest.TestCase):
         output.close.side_effect=restored
         reader._update_haptics();output.enable.assert_called_once()
         reader.close()
+
+    def test_missed_packet_retries_without_reopening_or_refreshing_sample(self):
+        sync=Sync();buf=LatestSample();conn=Connection()
+        reader=GelloReader(self.cfg,buf,connection_factory=lambda:conn,sync_factory=lambda c,ids:sync)
+        reader.open();reader.read_once();before=buf.read().acquired_at
+        sync.missing=3
+        with self.assertRaises(TimeoutError):reader.read_once()
+        self.assertFalse(conn.closed)
+        self.assertEqual(buf.read().acquired_at,before)
+        sync.missing=None;reader.read_once()
+        self.assertGreater(buf.read().acquired_at,before)
+        reader.close()
+
+    def test_missing_encoder_batch_zeros_haptics_and_preserves_write_failure(self):
+        from unittest.mock import Mock
+        sync=Sync();reader=GelloReader(self.cfg,LatestSample(),connection_factory=Connection,sync_factory=lambda c,ids:sync)
+        reader.open();output=Mock();output.active=True;reader.haptic_output=output
+        sync.missing=3
+        with self.assertRaises(TimeoutError):reader.read_once()
+        np.testing.assert_array_equal(output.write.call_args.args[0],np.zeros(7))
+        output.write.side_effect=ConnectionError('current write failed')
+        with self.assertRaisesRegex(ConnectionError,'current write failed'):reader.read_once()
+        reader.close()
+
+    def test_worker_recovers_missed_packet_on_same_connection(self):
+        import time
+        sync=Sync();buf=LatestSample();connections=[]
+        def connect():
+            c=Connection();connections.append(c);return c
+        reader=GelloReader(self.cfg,buf,connection_factory=connect,sync_factory=lambda c,ids:sync)
+        reader.start()
+        try:
+            deadline=time.monotonic()+1
+            while buf.read() is None and time.monotonic()<deadline:time.sleep(.005)
+            self.assertIsNotNone(buf.read())
+            sync.missing=3
+            deadline=time.monotonic()+1
+            while not buf.error and time.monotonic()<deadline:time.sleep(.005)
+            self.assertTrue(buf.transient_error)
+            sync.missing=None
+            deadline=time.monotonic()+1
+            while buf.error and time.monotonic()<deadline:time.sleep(.005)
+            self.assertFalse(buf.error)
+            self.assertEqual(len(connections),1)
+        finally:reader.close()
+
+    def test_stronger_haptics_still_ramp_current(self):
+        from unittest.mock import Mock,patch
+        from deploy.dashboard.haptics import HapticTarget
+        commands=LatestSample();commands.publish(HapticTarget(1.1,np.full(7,75.)))
+        reader=GelloReader(self.cfg,LatestSample(),haptics=commands)
+        output=Mock();output.active=True;reader.haptic_output=output;reader._haptic_previous=1.
+        with patch('deploy.dashboard.gello.time.monotonic',return_value=1.1):reader._update_haptics()
+        np.testing.assert_allclose(output.write.call_args.args[0],np.full(7,15.))
+
+    def test_hold_uses_encoder_pose_and_clears_on_stale_command(self):
+        from unittest.mock import Mock,patch
+        from deploy.dashboard.haptics import HapticTarget
+        commands=LatestSample();reader=GelloReader(self.cfg,LatestSample(),haptics=commands)
+        output=Mock();output.active=True;output.original={};reader.haptic_output=output
+        reader._haptic_previous=1.
+        commands.publish(HapticTarget(1.1,np.zeros(7),hold_percent=100.))
+        with patch('deploy.dashboard.gello.time.monotonic',return_value=1.1):reader._update_haptics(np.zeros(7))
+        commands.publish(HapticTarget(1.14,np.zeros(7),hold_percent=100.))
+        with patch('deploy.dashboard.gello.time.monotonic',return_value=1.14):reader._update_haptics(np.full(7,.02))
+        self.assertTrue(np.all(output.write.call_args.args[0][:6]<0))
+        self.assertEqual(output.write.call_args.args[0][-1],0.)
+        with patch('deploy.dashboard.gello.time.monotonic',return_value=1.5):reader._update_haptics(np.full(7,.02))
+        self.assertIsNone(reader.pose_hold.anchor)
+        output.close.assert_called_once()
+
+    def test_slow_successful_batch_cannot_drive_hold_from_old_encoders(self):
+        from unittest.mock import Mock,patch
+        sync=Sync();reader=GelloReader(self.cfg,LatestSample(),connection_factory=Connection,sync_factory=lambda c,ids:sync)
+        reader.open();output=Mock();output.active=True;reader.haptic_output=output
+        with patch('deploy.dashboard.gello.time.monotonic',side_effect=[1.,1.101,1.101,1.101]):
+            with self.assertRaises(TimeoutError):reader.read_once()
+        np.testing.assert_array_equal(output.write.call_args.args[0],np.zeros(7))
+        self.assertIsNone(reader.buffer.read())
+        self.assertIsNone(reader.pose_hold.anchor)
+        reader.close()

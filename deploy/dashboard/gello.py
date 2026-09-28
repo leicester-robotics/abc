@@ -5,7 +5,8 @@ import time
 import numpy as np
 from .samples import LeaderSample
 from .workers import DeviceWorker
-from .haptics import HapticOutput
+from .haptics import HapticOutput, CURRENT_RAMP_MA_PER_SECOND, CAP_MA
+from .leader_hold import CompliantHold
 
 
 def encoder_radians(counts):
@@ -27,6 +28,10 @@ def calibration_offsets(counts, signs):
     return (np.round((raw - reference / np.asarray(signs)) / (np.pi / 4)) * (np.pi / 4)).tolist()
 
 
+class EncoderReadTimeout(TimeoutError, ConnectionError):
+    transient_read = True
+
+
 class GelloReader(DeviceWorker):
     rate = 400.
 
@@ -34,6 +39,7 @@ class GelloReader(DeviceWorker):
         super().__init__(buffer)
         self.haptics = haptics
         self.haptic_output = None
+        self.pose_hold = CompliantHold()
         self._haptic_previous = 0.
         self._haptic_filtered = np.zeros(7)
         self.config = config
@@ -45,6 +51,7 @@ class GelloReader(DeviceWorker):
         self._individual_reads = False
 
     def open(self):
+        self.pose_hold.reset()
         self._individual_reads = False
         if self.config.calibration_path:
             from pathlib import Path
@@ -74,27 +81,41 @@ class GelloReader(DeviceWorker):
             raise
 
     def read_once(self):
+        try:
+            self._read_once()
+        except EncoderReadTimeout:
+            self.pose_hold.reset()
+            # Do not leave reflected torque applied during a missing encoder batch.
+            # A failed current write propagates as a fatal error, not a read retry.
+            if self.haptic_output is not None and self.haptic_output.active:
+                self.haptic_output.write(np.zeros(7))
+                self._haptic_filtered[:]=0
+            raise
+
+    def _read_once(self):
         started = time.monotonic()
         if not self._individual_reads:
             result = self.sync.txRxPacket()
             if result != 0:
                 if not hasattr(self.connection, 'packetHandler'):
-                    raise ConnectionError('GELLO read failed; check power, baudrate, and servo IDs')
+                    raise EncoderReadTimeout('GELLO read failed; check power, baudrate, and servo IDs')
                 self._individual_reads = True
         counts = []
         for motor_id in self.config.servo_ids:
             if self._individual_reads:
                 value, result, error = self.connection.packetHandler.read4ByteTxRx(
                     self.connection.portHandler, motor_id, 132)
-                if result != 0 or error != 0:
-                    raise ConnectionError(f'Invalid encoder reply from servo {motor_id}: {result}/{error}')
+                if error != 0:
+                    raise ConnectionError(f'Encoder hardware error from servo {motor_id}: {error}')
+                if result != 0:
+                    raise EncoderReadTimeout(f'Missing encoder reply from servo {motor_id}: {result}')
             else:
                 if not self.sync.isAvailable(motor_id, 132, 4):
-                    raise ConnectionError(f'No fresh position from servo {motor_id}')
+                    raise EncoderReadTimeout(f'No fresh position from servo {motor_id}')
                 value = self.sync.getData(motor_id, 132, 4)
             counts.append(value - 2**32 if value >= 2**31 else value)
         counts = np.array(counts)
-        self._update_haptics()
+        self._update_haptics(counts*np.pi/2048.,acquired_at=started)
         self.buffer.publish(LeaderSample(
             acquired_at=started, position=self.mapper.map(counts * (np.pi / 2048.)) if self.mapper else map_encoder(counts, self.config),
             counts=counts, radians=encoder_radians(counts), calibrated=self.config.calibrated,
@@ -102,14 +123,18 @@ class GelloReader(DeviceWorker):
                  'read_mode': 'individual' if self._individual_reads else 'sync',
                  'read_ms': round((time.monotonic()-started)*1000, 2),
                  'haptics_active': bool(self.haptic_output and self.haptic_output.active),
+                 'hold_active': self.pose_hold.anchor is not None,
                  'haptic_current_ma': self.haptic_output.current.tolist() if self.haptic_output else [0]*7},
         ))
 
-    def _update_haptics(self):
+    def _update_haptics(self, raw=None, acquired_at=None):
         now=time.monotonic()
+        if acquired_at is not None and not 0<=now-acquired_at<=.1:
+            raise EncoderReadTimeout('Encoder batch older than 100 ms; leader current zeroed')
         command=self.haptics.read() if self.haptics is not None else None
         valid=command is not None and command.enabled and 0<=now-command.acquired_at<=.1
         if not valid:
+            self.pose_hold.reset()
             if self.haptic_output is not None and (self.haptic_output.active or self.haptic_output.original):
                 self.haptic_output.close()
             self._haptic_filtered[:]=0
@@ -123,11 +148,14 @@ class GelloReader(DeviceWorker):
             return
         dt=now-self._haptic_previous
         if dt<.03:return
-        self._haptic_filtered+=np.clip(command.current_ma-self._haptic_filtered,-25*min(dt,.1),25*min(dt,.1))
+        support=self.pose_hold.current(raw,now,command.hold_percent,command.yield_degrees) if raw is not None else np.zeros(7)
+        desired=np.clip(command.current_ma+support,-CAP_MA,CAP_MA)
+        self._haptic_filtered+=np.clip(desired-self._haptic_filtered,-CURRENT_RAMP_MA_PER_SECOND*min(dt,.1),CURRENT_RAMP_MA_PER_SECOND*min(dt,.1))
         self.haptic_output.write(self._haptic_filtered)
         self._haptic_previous=now
 
     def _close_device(self):
+        self.pose_hold.reset()
         try:
             if self.haptic_output is not None:
                 self.haptic_output.close()

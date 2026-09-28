@@ -7,6 +7,41 @@ import numpy as np
 from .yam import PHYSICAL_BLOCKER
 
 
+def format_fault(state):
+    record=state.get('last_fault')
+    message=state.get('error','')
+    if not record and not message:return ''
+    reason=record['reason'] if record else message
+    if 'write 102' in reason and '-3001' in reason:
+        explanation='A force-feedback current command did not receive a motor acknowledgment before timeout, including its retry.'
+        recovery='Keep GELLO still. Check its USB and motor power connection, then use Clear fault and Enable robot teleop. Repeated failures need connection diagnosis.'
+    elif 'exceeds limits' in reason:
+        explanation='A measured position or GELLO target crossed its allowed range. The detail below identifies the joint, value, range, and measurement allowance.'
+        recovery='Return GELLO within its mapped range. If this happens at the saved home pose, check calibration. Clear fault, then reconnect if disconnected or enable teleop if holding.'
+    elif 'release' in reason.lower() and 'confirm' in reason.lower():
+        explanation='Motor release could not be verified. Motor torque state is uncertain.'
+        recovery='Support the arms, check power/CAN, and retry Release motors. Do not reconnect until release is confirmed.'
+    elif 'heartbeat' in reason.lower():
+        explanation=f'The controlling browser stopped sending heartbeats for more than {state.get("settings",{}).get("heartbeat_seconds",1.):g} seconds.'
+        recovery='Keep the dashboard visible and check the SSH tunnel. Enable teleop again once the connection is stable.'
+    elif 'supported' in reason:
+        explanation='Connect did not receive a fresh support confirmation; it has not started the robots.'
+        recovery='Support both arms, clear the grippers, check Arms supported; grippers clear, then click Connect robot.'
+    elif '200 ms' in reason or 'GELLO' in reason:
+        explanation='Leader or robot feedback was unavailable, stale, or reported a device error.'
+        recovery='Check the affected device in Arm data. Once fresh readings return, use Clear fault, then Enable robot teleop.'
+    else:
+        explanation='The requested operation could not complete. The original error is retained below.'
+        recovery='Check the device details in Arm data. Clear fault after resolving the cause; reconnect if the robot is disconnected.'
+    heading='Last recorded fault' if not message and state['mode']!='fault' else 'Fault / action needed'
+    text=f'### {heading}\n\n{explanation}\n\n**Exact detail:** {html.escape(reason)}\n\n'
+    if record:text+=f"**Occurred:** {html.escape(record['time'])} · during {html.escape(record['stage'])}\n\n"
+    if message and message!=reason:text+=f'**Current message:** {html.escape(message)}\n\n'
+    if state['mode']=='fault':text+='**Teleop stopped; force feedback requested off.**\n\n'
+    text+=f'**Recovery:** {recovery}'
+    return text
+
+
 def heartbeat_html(button_id, view_buttons=None):
     # Viser renders button UUIDs as DOM IDs. An iframe executes the timer without
     # modifying Viser's installed frontend. Clicks use its existing client socket.
@@ -84,6 +119,7 @@ class DashboardUI:
                                    show_logo=False, show_share_button=False, brand_color=(41,181,163))
         server.gui.add_markdown('# GELLO · YAM\n**Headless teleoperation station**')
         self.status=server.gui.add_markdown('Starting simulation…')
+        self.fault_panel=server.gui.add_markdown('')
         self.control_buttons={}
         self.images={};self.depth_images={};self.camera_status={};self.camera_times={}
         self.leader_text={};self.sim_text={};self.robot_text={}
@@ -97,10 +133,10 @@ class DashboardUI:
                 server.gui.add_button('Reset view').on_click(lambda _: self.reset_view())
                 self.sim_status=server.gui.add_markdown('Awaiting GELLO mapping.')
             with server.gui.add_folder('Robot control', expand_by_default=False):
-                server.gui.add_markdown('Simulation starts without energizing YAM. **Connect** can energize motors and calibrate the gripper. Enable teleop aligns the robot at 0.25 rad/s. Return to simulation keeps the robot holding position.')
+                server.gui.add_markdown('Simulation starts without energizing YAM. **Connect** can energize motors and calibrate the gripper. Enable teleop aligns the robot at the speed selected in Teleop settings. Return to simulation keeps the robot holding position.')
                 force=server.gui.add_checkbox('Force feedback during teleop',initial_value=True)
                 force.on_update(lambda event: supervisor.request('haptics_on' if event.target.value else 'haptics_off',event.client_id))
-                self.haptic_status=server.gui.add_markdown('Force feedback waits for teleop; 25 mA motor current cap.')
+                self.haptic_status=server.gui.add_markdown('Force feedback waits for teleop; 75 mA motor current cap.')
                 support=server.gui.add_checkbox('Arms supported; grippers clear',initial_value=False)
                 support.on_update(lambda event: supervisor.request('confirm_support' if event.target.value else 'cancel_support',event.client_id))
                 server.gui.add_markdown('Check this immediately before each connection. Startup can leave arms without hold briefly; a failed connection disables torque.')
@@ -108,9 +144,12 @@ class DashboardUI:
                                       ('simulation','Return to simulation'),('recover','Clear fault'),
                                       ('release','Release motors / disconnect (support arms first)')]:
                     button=server.gui.add_button(label, color='red' if action=='release' else None)
-                    button.on_click(lambda event, a=action: supervisor.request(a,event.client_id))
+                    def on_action(event, a=action):
+                        supervisor.request(a,event.client_id)
+                        if a=='connect':support.value=False
+                    button.on_click(on_action)
                     self.control_buttons[action]=button
-            server.gui.add_markdown('Physical teleop is locked. Details are in Setup.' if PHYSICAL_BLOCKER else 'Connect calibrates the grippers, moves the robot to the saved simulation home pose at 0.25 rad/s, then holds. Enable teleop starts following. Keep GELLO still during alignment.')
+            server.gui.add_markdown('Physical teleop is locked. Details are in Setup.' if PHYSICAL_BLOCKER else 'Connect calibrates the grippers, moves the robot to the saved simulation home pose at the configured alignment speed, then holds. Enable teleop starts following. Keep GELLO still during alignment.')
         with tabs.add_tab('Cameras'):
             server.gui.add_markdown('Camera previews stream while this tab is open. Capture continues in the background.')
             with server.gui.add_folder('RealSense live streams',expand_by_default=True):
@@ -131,6 +170,16 @@ class DashboardUI:
                     for side in ('left','right'):
                         with sides.add_tab(side.capitalize()):
                             handles[side]=server.gui.add_markdown(placeholder)
+        with tabs.add_tab('Teleop settings'):
+            from .settings import FIELDS
+            server.gui.add_markdown('Adjust values, then **Apply settings**. Changes take effect immediately for this session. During motion, only the controlling browser can apply them.')
+            self.setting_inputs={}
+            for key,(label,low,high,step) in FIELDS.items():
+                self.setting_inputs[key]=server.gui.add_slider(label,min=low,max=high,step=step,initial_value=supervisor.settings.as_dict()[key])
+            apply_settings=server.gui.add_button('Apply settings')
+            apply_settings.on_click(lambda event:supervisor.request_settings({k:v.value for k,v in self.setting_inputs.items()},event.client_id))
+            self.settings_status=server.gui.add_markdown('Loading applied settings…')
+            server.gui.add_markdown('100% feedback = 15 mA/Nm; 200% = 30 mA/Nm. Motor current remains capped at 75 mA. Feedback reflects robot motor effort, including gravity and friction.\n\nGELLO hold is a yielding spring during teleop: strength 0 disables it; yield distance sets how far you push before its anchor follows. It shares the 75 mA cap with feedback and leaves the gripper free. Hold stops when teleop stops.\n\nRobot commands remain inside their joint limits. Hardware feedback expires after 200 ms; haptic feedback expires after 100 ms.')
         with tabs.add_tab('Setup'):
             if PHYSICAL_BLOCKER:
                 server.gui.add_markdown('**Physical control unavailable:** '+PHYSICAL_BLOCKER)
@@ -154,13 +203,13 @@ class DashboardUI:
                 if event.client_id==client.client_id:
                     supervisor.heartbeat(str(client.client_id),time.monotonic())
             view_buttons={}
-            for view in ('Simulation','Cameras','Arm data','Setup'):
+            for view in ('Simulation','Cameras','Arm data','Teleop settings','Setup'):
                 hidden=client.gui.add_button(f'View signal {view}',order=9999)
                 @hidden.on_click
                 def changed(event, name=view):
                     if event.client_id==client.client_id:
                         self.client_views[client.client_id]=name
-                        client.gui.main_panel.set_width(900 if name in ('Arm data','Cameras','Setup') else 400)
+                        client.gui.main_panel.set_width(900 if name in ('Arm data','Cameras','Teleop settings','Setup') else 400)
                 view_buttons[view]=hidden._impl.uuid
             self.client_views[client.client_id]='Simulation'
             client.gui.add_html(heartbeat_html(beat._impl.uuid,view_buttons),order=10000)
@@ -181,6 +230,11 @@ class DashboardUI:
         state=snapshot['control'];mode=state['mode']
         title={'simulation':'SIMULATION ONLY','holding':'SIMULATION / ROBOT HOLDING','aligning':'ROBOT ALIGNING','teleop':'PHYSICAL TELEOP ENABLED','fault':'SIMULATION / ROBOT FAULT','connecting':'CONNECTING ROBOT'}[mode]
         self.status.content=f'## {title}\n'+('**DEMO — synthetic simulation motion**\n\n' if self.demo else '')+f'Controller: {state["owner"] or "none"}\n\n'+html.escape(state['error'])
+        self.fault_panel.content=format_fault(state)
+        self.fault_panel.visible=bool(state.get('last_fault') or state.get('error'))
+        from .settings import FIELDS
+        applied=state.get('settings',{})
+        self.settings_status.content=('**Apply failed:** '+html.escape(state['settings_error'])+'\n\n' if state.get('settings_error') else '')+f'**Applied settings · revision {state.get("settings_revision",0)}**\n\n'+ '\n\n'.join(f'{FIELDS[k][0]}: **{v:.3g}**' for k,v in applied.items())
         ready=not PHYSICAL_BLOCKER and bool(self.config.arms) and all(a.calibrated and a.mapping_verified for a in self.config.arms)
         self.control_buttons['connect'].disabled=self.demo or not ready or mode!='simulation'
         self.control_buttons['enable'].disabled=self.demo or not ready or mode!='holding'
@@ -189,7 +243,7 @@ class DashboardUI:
         self.sim_status.content=snapshot['sim_status']+f'\n\nScene: {snapshot.get("scene_rate",0.):.1f} Hz'
         self.setup_status.content=snapshot.get('setup_status',self.setup_status.content)
         active=[side for side,sample in snapshot['leaders'].items() if sample is not None and now-sample.acquired_at<.2 and sample.raw.get('haptics_active')]
-        self.haptic_status.content='Force feedback active: '+(', '.join(active) or 'none')+' · current cap 25 mA per motor. Reflected motor effort includes gravity and friction.'
+        self.haptic_status.content='Leader current output active: '+(', '.join(active) or 'none')+' · current cap 75 mA per motor. Hold active: '+(', '.join(side for side,sample in snapshot['leaders'].items() if sample is not None and now-sample.acquired_at<.2 and sample.raw.get('hold_active')) or 'none')+'. Reflected motor effort includes gravity and friction.'
         for side in self.leader_text:
             leader=snapshot['leaders'].get(side)
             self.leader_text[side].content=format_arm('GELLO · mapped + raw',leader,now)+'\n'+html.escape(snapshot['errors'].get(side,''))

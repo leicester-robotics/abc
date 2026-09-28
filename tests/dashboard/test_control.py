@@ -45,7 +45,7 @@ class ControlTests(unittest.TestCase):
         self.supervisor.heartbeat('a',self.now);self.supervisor.tick(self.now)
         self.assertLessEqual(np.max(np.abs(self.adapter.commands[-1]-self.adapter.q)),.050001)
     def test_nonowner_cannot_renew_or_enable(self):
-        self.enable();self.now+=.501;self.publish()
+        self.enable();self.now+=1.001;self.publish()
         self.supervisor.heartbeat('b',self.now);self.request('enable','b')
         self.assertNotEqual(self.supervisor.mode,'teleop')
         self.assertIsNone(self.supervisor.owner)
@@ -96,7 +96,7 @@ class ControlTests(unittest.TestCase):
         result=checked(ArmSample(self.now,q),self.now)
         self.assertEqual(result[1],LOW[1])
         self.assertEqual(result[3],HIGH[3])
-        q[1]=-.02
+        q[1]=-.09
         with self.assertRaises(ValueError):checked(ArmSample(self.now,q),self.now)
 
     def test_physical_connect_requires_fresh_support_confirmation(self):
@@ -129,7 +129,7 @@ class ControlTests(unittest.TestCase):
         self.supervisor.tick(self.now)
         self.assertGreater(self.adapter.commands[-1][0],before[0])
         self.assertLessEqual(self.adapter.commands[-1][0]-before[0],.025001)
-        self.now+=.501;self.publish(goal);self.supervisor.tick(self.now)
+        self.now+=1.001;self.publish(goal);self.supervisor.tick(self.now)
         self.assertEqual(self.supervisor.mode,'holding')
 
     def test_alignment_enters_teleop_only_after_robot_reaches_leader(self):
@@ -181,3 +181,103 @@ class ControlTests(unittest.TestCase):
         self.assertTrue(commands.read().enabled)
         self.assertAlmostEqual(commands.read().acquired_at,self.now-.09)
         self.assertGreater(self.now+.02-commands.read().acquired_at,.1)
+
+    def test_brief_browser_delay_does_not_stop_fresh_hardware(self):
+        self.enable();self.now+=.75;self.publish();self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'teleop')
+        self.now+=.251;self.publish();self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'holding')
+
+    def test_transient_read_error_uses_only_still_fresh_sample(self):
+        self.enable();self.buf.set_error('missed encoder packet',transient=True)
+        self.now+=.05;self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'teleop')
+        self.now+=.151;self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'fault')
+
+    def test_fatal_reader_error_stops_even_with_fresh_sample(self):
+        self.enable();self.buf.set_error('haptic torque-off not confirmed')
+        self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'fault')
+        self.assertIn('haptic torque-off',self.supervisor.error)
+
+    def test_physical_home_feedback_accepts_small_stop_error_but_clips_commands(self):
+        from deploy.dashboard.control import checked,HIGH
+        q=self.adapter.q.copy();q[3]=1.58217
+        result=checked(ArmSample(self.now,q),self.now,observation=True)
+        self.assertEqual(result[3],HIGH[3])
+        q[3]=1.61
+        with self.assertRaises(ValueError):checked(ArmSample(self.now,q),self.now,observation=True)
+        q[3]=1.58217
+        self.assertEqual(checked(ArmSample(self.now,q),self.now)[3],HIGH[3])
+
+    def test_connect_accepts_physical_home_stop_measurement(self):
+        self.adapter.q[3]=1.58217
+        leader=self.adapter.q.copy();leader[3]=1.57;self.publish(leader)
+        self.request('connect')
+        self.assertEqual(self.supervisor.mode,'holding')
+        self.assertLessEqual(self.adapter.commands[-1][3],1.57)
+
+    def test_original_fault_survives_later_button_error(self):
+        self.enable();self.buf.set_error('GELLO 5 write 102: -3001/0')
+        self.supervisor.tick(self.now)
+        first=self.supervisor.status()['last_fault']
+        self.request('connect')
+        self.assertEqual(self.supervisor.status()['last_fault'],first)
+        self.assertIn('GELLO 5',first['reason'])
+
+    def test_gello_near_home_offset_does_not_fault_or_command_negative_joint(self):
+        self.enable()
+        q=self.adapter.q.copy();q[1]=-.01074
+        self.publish(q);self.now+=.03;self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'teleop')
+        self.assertGreaterEqual(self.adapter.commands[-1][1],0.)
+        q[1]=-.09;self.publish(q);self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'fault')
+
+    def test_gello_five_degree_margin_clips_at_both_joint_limits(self):
+        from deploy.dashboard.control import checked,LOW,HIGH
+        for index in range(6):
+            for bound,direction in [(LOW[index],-1),(HIGH[index],1)]:
+                q=self.adapter.q.copy();q[index]=bound+direction*np.deg2rad(4.99)
+                self.assertAlmostEqual(checked(ArmSample(self.now,q),self.now)[index],bound)
+                q[index]=bound+direction*np.deg2rad(5.01)
+                with self.assertRaises(ValueError):checked(ArmSample(self.now,q),self.now)
+
+    def test_live_settings_validate_atomically_and_require_owner(self):
+        self.enable()
+        self.supervisor.request_settings({'leader_margin_deg':8.,'feedback_percent':150.},'b')
+        self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.settings.leader_margin_deg,5.)
+        self.assertIn('controlling browser',self.supervisor.status()['settings_error'])
+        self.supervisor.request_settings({'leader_margin_deg':8.,'feedback_percent':float('nan')},'a')
+        self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.settings.leader_margin_deg,5.)
+        self.supervisor.request_settings({'leader_margin_deg':8.,'feedback_percent':150.},'a')
+        self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.settings.leader_margin_deg,8.)
+        self.assertEqual(self.supervisor.settings.feedback_percent,150.)
+        self.assertEqual(self.supervisor.mode,'teleop')
+
+    def test_live_settings_change_margin_speed_and_feedback(self):
+        commands=LatestSample();self.supervisor.haptics={'left':commands}
+        self.adapter.observe=lambda:ArmSample(self.now,self.adapter.q.copy(),effort=np.ones(7),raw={'gripper_direction':1})
+        self.enable()
+        self.supervisor.request_settings({'leader_margin_deg':8.,'teleop_speed':1.,'feedback_percent':200.},'a')
+        self.supervisor.tick(self.now)
+        np.testing.assert_allclose(commands.read().current_ma,[-30]*7)
+        q=self.adapter.q.copy();q[0]+=.5;q[1]=-.1
+        self.publish(q);self.now+=.1;self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'teleop')
+        self.assertAlmostEqual(self.adapter.commands[-1][0],.1)
+        self.assertGreaterEqual(self.adapter.commands[-1][1],0.)
+
+    def test_hold_is_independent_of_reflection_but_stops_with_teleop(self):
+        commands=LatestSample();self.supervisor.haptics={'left':commands}
+        self.enable();self.request('haptics_off')
+        self.assertTrue(commands.read().enabled)
+        self.assertEqual(commands.read().hold_percent,100.)
+        np.testing.assert_equal(commands.read().current_ma,np.zeros(7))
+        self.request('simulation')
+        self.assertFalse(commands.read().enabled)
+        self.assertEqual(commands.read().hold_percent,0.)

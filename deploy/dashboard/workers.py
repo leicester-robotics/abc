@@ -24,7 +24,7 @@ class DeviceWorker:
                     try:
                         self.read_once()
                     except TimeoutError as error:
-                        self.buffer.set_error(str(error))
+                        self.buffer.set_error(str(error), transient=getattr(error, "transient_read", False))
                     self._stop.wait(max(0., 1 / self.rate - (time.monotonic() - start)))
             except Exception as error:
                 self.buffer.set_error(f'{type(error).__name__}: {error}')

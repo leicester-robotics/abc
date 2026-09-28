@@ -17,7 +17,9 @@ class PhysicalTests(unittest.TestCase):
         def sleep(dt):clock[0]+=dt
         with patch('deploy.dashboard.physical.time.monotonic',side_effect=lambda:clock[0]),patch('deploy.dashboard.physical.time.sleep',side_effect=sleep):
             limits=calibrate_gripper(chain,max_duration=1.,check_interval=.1,travel_range=(6.,7.))
-        self.assertGreater(abs(limits[1]-limits[0]),.9)
+        np.testing.assert_allclose(limits,[3.285,-3.285])
+        # The physical closed stop must map to zero, not an unreachable overtravel goal.
+        self.assertAlmostEqual((3.285-limits[0])/(limits[1]-limits[0]),0.)
         for torque,cmd in chain.commands:
             np.testing.assert_allclose(cmd['pos'][:6],[.1,.5,1.,-.5,.1,.2])
             self.assertTrue(np.all(cmd['kp'][:6]>0))

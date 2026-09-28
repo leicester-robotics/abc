@@ -35,7 +35,7 @@ def validate_gripper_travel(span, bounds):
 
 
 def calibrate_gripper(motor_chain,gripper_index=6,test_torque=.2,max_duration=2.,
-                      position_threshold=.01,check_interval=.1,close_offset=.05,travel_range=None):
+                      position_threshold=.01,check_interval=.1,close_offset=0.,travel_range=None):
     """Sweep only the gripper while the six arm joints hold their measured pose."""
     if gripper_index!=6 or len(motor_chain.motor_list)!=7:
         raise ValueError('Expected six YAM joints and one gripper')
@@ -66,6 +66,8 @@ def calibrate_gripper(motor_chain,gripper_index=6,test_torque=.2,max_duration=2.
     validate_gripper_travel(high-low,travel_range)
     direction=motor_chain.motor_direction[-1]
     limits=[high,low] if direction>0 else [low,high]
+    # Dashboard coordinates use measured stops; a closed-end overtravel offset
+    # would make zero unreachable and keep alignment waiting at a closed gripper.
     limits[0]+=close_offset*(high-low)*direction
     return limits
 
