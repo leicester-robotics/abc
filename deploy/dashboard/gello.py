@@ -27,7 +27,7 @@ def calibration_offsets(counts, signs):
 
 
 class GelloReader(DeviceWorker):
-    rate = 100.
+    rate = 400.
 
     def __init__(self, config, buffer, connection_factory=None, sync_factory=None):
         super().__init__(buffer)
@@ -36,9 +36,18 @@ class GelloReader(DeviceWorker):
         self.sync_factory = sync_factory
         self.connection = None
         self.sync = None
+        self.mapper = None
         self._individual_reads = False
 
     def open(self):
+        self._individual_reads = False
+        if self.config.calibration_path:
+            from pathlib import Path
+            from .saved_calibration import Calibration, RelativeMapper
+            cal = Calibration.load(Path(self.config.calibration_path))
+            if (cal.port, cal.ids, cal.baudrate) != (self.config.device, self.config.servo_ids, self.config.baudrate):
+                raise ValueError('Saved calibration does not match arm device, IDs and baudrate')
+            self.mapper = RelativeMapper(cal)
         if self.connection_factory:
             self.connection = self.connection_factory()
         else:
@@ -79,7 +88,7 @@ class GelloReader(DeviceWorker):
             counts.append(value - 2**32 if value >= 2**31 else value)
         counts = np.array(counts)
         self.buffer.publish(LeaderSample(
-            acquired_at=started, position=map_encoder(counts, self.config),
+            acquired_at=started, position=self.mapper.map(counts * (np.pi / 2048.)) if self.mapper else map_encoder(counts, self.config),
             counts=counts, radians=encoder_radians(counts), calibrated=self.config.calibrated,
             raw={'servo_ids': self.config.servo_ids, 'device': self.config.device,
                  'read_mode': 'individual' if self._individual_reads else 'sync',

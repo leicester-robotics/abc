@@ -52,8 +52,10 @@ class RealSenseSource:
 
     def close(self):
         if self.started:
-            self.pipeline.stop()
-            self.started = False
+            try:
+                self.pipeline.stop()
+            finally:
+                self.started = False
 
 
 class CameraWorker(DeviceWorker):
@@ -78,5 +80,5 @@ class CameraWorker(DeviceWorker):
 
     def _close_device(self):
         if self.source is not None:
-            self.source.close()
-            self.source = None
+            source, self.source = self.source, None
+            source.close()

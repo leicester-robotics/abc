@@ -8,7 +8,7 @@ from .samples import ArmSample
 
 
 class Simulation:
-    def __init__(self, model_path: Path, asset_dir: Path | None = None):
+    def __init__(self, model_path: Path, asset_dir: Path | None = None, home=None):
         model_path=Path(model_path).resolve()
         root=ET.parse(model_path).getroot()
         compiler=root.find('compiler')
@@ -28,12 +28,17 @@ class Simulation:
             self.actuator_ids[side]=ids
             self.qpos_ids[side]=self.model.jnt_qposadr[joints]
             self.dof_ids[side]=self.model.jnt_dofadr[joints]
+        self.home=home
         self.targets={}
         self._remainder=0.
         self.reset()
 
     def reset(self):
         mujoco.mj_resetDataKeyframe(self.model,self.data,self.model.key('home').id)
+        if self.home is not None:
+            for side in self.actuator_ids:
+                self.set_target(side,self.home)
+                self.data.qpos[self.qpos_ids[side]]=self.data.ctrl[self.actuator_ids[side]]
         mujoco.mj_forward(self.model,self.data)
         self._remainder=0.
         for side in self.actuator_ids:

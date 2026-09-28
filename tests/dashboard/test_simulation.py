@@ -36,3 +36,11 @@ class SimulationTests(unittest.TestCase):
     def test_missing_mesh_error(self):
         with self.assertRaisesRegex(FileNotFoundError,'asset'):
             Simulation(MODEL,asset_dir=Path('/does/not/exist'))
+
+    def test_station_rest_home_on_start_and_reset(self):
+        home=[0.,0.,0.,1.5708,0.,0.,.5]
+        sim=Simulation(MODEL,asset_dir=ASSETS,home=home)
+        for side in ('left','right'):
+            np.testing.assert_allclose(sim.snapshot(side).position,home)
+        sim.step(.02);sim.reset()
+        np.testing.assert_allclose(sim.snapshot('left').position,home)

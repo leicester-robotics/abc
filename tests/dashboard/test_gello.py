@@ -57,3 +57,43 @@ class GelloTests(unittest.TestCase):
         reader.open();reader.read_once();reader.close()
         np.testing.assert_equal(buf.read().counts,np.arange(7)+2048)
         self.assertEqual(buf.read().raw['read_mode'],'individual')
+
+    def test_reconnect_retries_sync_after_transient_failure(self):
+        class Packet:
+            def read4ByteTxRx(self,port,motor,address):return 2048,0,0
+        conn=Connection();conn.packetHandler=Packet();conn.portHandler=object()
+        sync=Sync();sync.result=1;buf=LatestSample()
+        reader=GelloReader(self.cfg,buf,connection_factory=lambda:conn,sync_factory=lambda c,ids:sync)
+        reader.open();reader.read_once();reader._close_device()
+        sync.result=0;reader.open();reader.read_once();reader.close()
+        self.assertEqual(buf.read().raw['read_mode'],'sync')
+
+    def test_saved_calibration_signs_home_and_encoder_wrap(self):
+        from deploy.dashboard.saved_calibration import Calibration
+        from pathlib import Path
+        path='deploy/dashboard/calibrations/left.relative.json'
+        cal=Calibration.load(Path(path))
+        cfg=ArmConfig('left',cal.port,cal.ids,cal.signs+[1],calibration_path=path,baudrate=cal.baudrate)
+        counts=np.rint(np.asarray(cal.home_raw)*2048/np.pi).astype(int)
+        # Joint five's encoder can reboot one revolution lower.
+        counts[4]-=4096
+        class PoseSync(Sync):
+            def getData(self,i,a,n):return int(counts[i-1]) % 2**32
+        buf=LatestSample();reader=GelloReader(cfg,buf,connection_factory=Connection,sync_factory=lambda c,ids:PoseSync())
+        reader.open();reader.read_once()
+        np.testing.assert_allclose(buf.read().position[:6],cal.home_target,atol=1e-8)
+        counts[2]+=100;counts[3]+=100
+        reader.read_once()
+        self.assertGreater(buf.read().position[2],.15)
+        self.assertGreater(buf.read().position[3],1.72)
+        self.assertTrue(buf.read().calibrated)
+        reader.close()
+
+    def test_saved_calibration_follows_device_when_side_label_is_corrected(self):
+        from deploy.dashboard.saved_calibration import Calibration
+        from pathlib import Path
+        path='deploy/dashboard/calibrations/left.relative.json'
+        cal=Calibration.load(Path(path))
+        cfg=ArmConfig('right',cal.port,cal.ids,cal.signs+[1],calibration_path=path,baudrate=cal.baudrate)
+        reader=GelloReader(cfg,LatestSample(),connection_factory=Connection,sync_factory=lambda c,ids:Sync())
+        reader.open();reader.read_once();reader.close()

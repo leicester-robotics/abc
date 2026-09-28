@@ -29,7 +29,10 @@ class DeviceWorker:
             except Exception as error:
                 self.buffer.set_error(f'{type(error).__name__}: {error}')
             finally:
-                self._close_device()
+                try:
+                    self._close_device()
+                except Exception as error:
+                    self.buffer.set_error(f'{self.buffer.error}; cleanup: {error}')
             self._stop.wait(1.)
 
     def close(self):

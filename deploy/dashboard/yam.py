@@ -74,15 +74,7 @@ class YamAdapter:
             raise RuntimeError(PHYSICAL_BLOCKER)
         if not self.config.mapping_verified or not self.config.calibrated:
             raise RuntimeError('Verify station mapping and calibration before connecting')
-        if self.factory is None:
-            from deploy.robot.followers.yam_follower import _patch_gripper_calibration
-            from i2rt.robots.get_robot import get_yam_robot
-            from i2rt.robots.utils import GripperType
-            _patch_gripper_calibration()
-            factory = lambda: get_yam_robot(channel=self.config.channel,
-                gripper_type=GripperType[self.config.gripper_type.upper()], zero_gravity_mode=False)
-        else:
-            factory = self.factory
+        factory = self.factory
         self.robot = factory()
         try:
             chain = self.robot.motor_chain
@@ -131,7 +123,7 @@ class YamAdapter:
 
     def close(self):
         if self.robot is not None:
-            # i2rt.close stops threads and releases torque; never calls move_joints.
+            # Only injected test/integration backends reach here. The installed production driver is blocked.
             self.robot.close()
             if self._original_update is not None:
                 self.robot.motor_chain._update_absolute_positions = self._original_update

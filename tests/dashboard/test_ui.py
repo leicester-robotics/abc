@@ -17,3 +17,19 @@ class UITests(unittest.TestCase):
         self.assertIn('rad',text)
         self.assertIn('STALE',text)
         self.assertIn('normalized',text)
+
+    def test_sim_target_and_error_are_visible(self):
+        from deploy.dashboard.ui import format_simulation
+        text=format_simulation(ArmSample(1.,np.zeros(7)),np.full(7,.1),now=1.)
+        self.assertIn('Target',text)
+        self.assertIn('Error',text)
+        self.assertIn('0.1000',text)
+
+    def test_offsets_and_measured_rates_are_visible(self):
+        from deploy.dashboard.ui import format_diagnostics
+        from deploy.dashboard.config import ArmConfig
+        arm=ArmConfig('left','test',list(range(7)),[1]*7,[.125]*7)
+        text=format_diagnostics(arm,50.,[.05]*7)
+        self.assertIn('0.125',text)
+        self.assertIn('50.0 Hz',text)
+        self.assertIn('Alignment',text)

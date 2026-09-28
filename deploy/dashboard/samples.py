@@ -36,9 +36,15 @@ class LatestSample:
         self._lock = threading.Lock()
         self._sample = None
         self._error = ''
+        self._rate_hz = 0.
 
     def publish(self, sample):
         with self._lock:
+            if self._sample is not None:
+                elapsed = sample.acquired_at-self._sample.acquired_at
+                if elapsed > 0:
+                    rate = 1./elapsed
+                    self._rate_hz = rate if self._rate_hz == 0 else .2*rate+.8*self._rate_hz
             self._sample = copy.deepcopy(sample)
             self._error = ''
 
@@ -54,3 +60,8 @@ class LatestSample:
     def error(self) -> str:
         with self._lock:
             return self._error
+
+    @property
+    def rate_hz(self) -> float:
+        with self._lock:
+            return self._rate_hz

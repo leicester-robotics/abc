@@ -16,3 +16,9 @@ class SampleTests(unittest.TestCase):
         buffer.set_error('lost connection')
         self.assertEqual(buffer.read().acquired_at, 10.)
         self.assertEqual(buffer.error, 'lost connection')
+
+    def test_rate_uses_acquisition_times(self):
+        buffer=LatestSample()
+        buffer.publish(ArmSample(10.,np.zeros(7)))
+        buffer.publish(ArmSample(10.02,np.zeros(7)))
+        self.assertAlmostEqual(buffer.rate_hz,50.)

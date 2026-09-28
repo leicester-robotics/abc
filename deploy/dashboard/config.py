@@ -21,10 +21,11 @@ class ArmConfig:
     gripper_type: str = 'linear_4310'
     gripper_range: list[float] = field(default_factory=lambda: [-0.6040225, 0.33736414])
     baudrate: int = 4_000_000
+    calibration_path: str | None = None
 
     @property
     def calibrated(self) -> bool:
-        return self.offsets is not None
+        return self.offsets is not None or self.calibration_path is not None
 
 
 @dataclass
@@ -41,6 +42,7 @@ class DashboardConfig:
     model_path: str = 'abc_sim/models/yam_bimanual_empty.xml'
     asset_dir: str | None = None
     port: int = 8080
+    simulation_home: list[float] | None = None
 
 
 def validate(cfg: DashboardConfig) -> DashboardConfig:
@@ -54,6 +56,8 @@ def validate(cfg: DashboardConfig) -> DashboardConfig:
     unique([c.label for c in cfg.cameras], 'camera label')
     if not 1 <= cfg.port <= 65535:
         raise ValueError('Port must be between 1 and 65535')
+    if cfg.simulation_home is not None and (len(cfg.simulation_home) != 7 or not all(math.isfinite(v) for v in cfg.simulation_home)):
+        raise ValueError('Simulation home must contain seven finite values')
     for arm in cfg.arms:
         if arm.side not in ('left', 'right') or not arm.device:
             raise ValueError('Each arm needs a left/right side and device path')

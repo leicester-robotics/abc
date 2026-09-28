@@ -35,6 +35,8 @@ class ControlSupervisor:
         self.targets = {}
         self.alignment = {}
         self._requests = queue.Queue(maxsize=32)
+        self._teleop_stop = threading.Event()
+        self._release_uncertain = False
         self._heartbeats = {}
         self._heartbeat_lock = threading.Lock()
         self._status_lock = threading.Lock()
@@ -46,13 +48,13 @@ class ControlSupervisor:
         self._publish()
 
     def request(self, action, client_id):
+        if action == 'simulation' or (action == 'disconnect' and str(client_id) == self.owner):
+            self._teleop_stop.set()
+            return
         try:
             self._requests.put_nowait((action, str(client_id), self._generation))
         except queue.Full:
-            # Disabling must survive a full control queue.
-            if action in ('simulation', 'disconnect'):
-                with self._heartbeat_lock:
-                    self._heartbeats.clear()
+            pass  # Stop requests use a separate latched event and cannot be dropped.
 
     def heartbeat(self, client_id, now):
         with self._heartbeat_lock:
@@ -81,6 +83,9 @@ class ControlSupervisor:
         self._generation += 1
         self.mode = 'fault' if fault else 'holding' if self.adapters else 'simulation'
         self.error = reason
+        if self._release_uncertain:
+            self.mode = 'fault'
+            self.error = 'Robot release unconfirmed; retry release before recovery'
         for side, adapter in self.adapters.items():
             try:
                 sample = adapter.observe()
@@ -108,8 +113,11 @@ class ControlSupervisor:
             self._hold(now)
             self._close_adapters()
             self.mode = 'simulation'
+            self.error = ''
             return
         if action == 'recover':
+            if self._release_uncertain:
+                raise ValueError('Robot release unconfirmed; retry release')
             if self.mode != 'fault':
                 return
             for adapter in self.adapters.values():
@@ -162,6 +170,14 @@ class ControlSupervisor:
     def tick(self, now):
         dt = min(max(now-self._previous, 0.), .1)
         self._previous = now
+        if self._teleop_stop.is_set():
+            self._teleop_stop.clear()
+            while not self._requests.empty():
+                try:
+                    self._requests.get_nowait()
+                except queue.Empty:
+                    break
+            self._hold(now)
         if self.mode == 'teleop' and not self._lease_valid(self.owner, now):
             self._hold(now, reason='Browser disconnected or heartbeat expired')
         for _ in range(32):
@@ -222,14 +238,19 @@ class ControlSupervisor:
 
     def _close_adapters(self):
         errors = []
-        for adapter in self.adapters.values():
+        for side, adapter in list(self.adapters.items()):
             try:
                 adapter.close()
             except Exception as error:
-                errors.append(str(error))
-        self.adapters.clear()
+                errors.append(f'{side}: {error}')
+            else:
+                del self.adapters[side]
+        self._release_uncertain = bool(errors)
         if errors:
-            raise RuntimeError('Robot release not confirmed: '+ '; '.join(errors))
+            self.mode = 'fault'
+            self.owner = None
+            self.error = 'Robot release not confirmed: '+ '; '.join(errors)
+            raise RuntimeError(self.error)
 
     def close(self):
         self._stop.set()

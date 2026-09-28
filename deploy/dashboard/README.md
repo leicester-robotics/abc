@@ -21,11 +21,17 @@ occupies 8080. It records these discovered devices:
 | Right GELLO | FTBEO6Y3 (`ttyUSB1`), IDs 1–7 at 2 Mbps |
 | RealSense D405 cameras | 427622271843, 427622273082, 427622272514 |
 
-Left/right GELLO identity was verified by moving only the left base joint.
-Camera placement, joint signs, gripper configuration, and absolute calibration
-still require operator verification. Camera labels are neutral until assigned.
-The configuration deliberately has no calibrated offsets and no verified
-physical mapping. The existing motor baud rates have not been changed.
+Saved calibration from `origin/mhasek/abc_gello` commit `d4abb33` supplies
+joint signs, home angles, and gripper endpoints. The saved side labels are
+reversed on this station: each calibration stays with its USB adapter, while
+the operator-confirmed side mapping is left Y6 / right Y3. Both arms use
+joint signs `[1, -1, 1, 1, 1, 1]`. Verify the mapping in simulation before physical
+commissioning. Motor baud rates remain unchanged at 2 Mbps.
+
+The simulator starts and resets at `[0, 0, 0, 1.5708, 0, 0]` with the gripper
+half open. Saved relative calibration aligns encoders to the nearest revolution
+of the saved home on connection; keep the leader near that pose when reconnecting.
+Camera labels remain neutral until placements are assigned.
 
 ### Open it from your computer
 
@@ -58,9 +64,22 @@ Create `outputs/dashboard/` first if needed. View output with
 `tmux attach -t gello-dashboard` and press Ctrl-C. This allows camera and serial
 handles to close. A later launch starts in simulation mode again.
 
+## Dashboard layout
+
+- **Simulation:** robot view, preview/reset, and physical-control status.
+- **Cameras:** live RGB/depth previews; this tab enables image transmission.
+- **Arm data:** wide panel with GELLO / MuJoCo / Physical YAM tabs and Left / Right selectors.
+- **Setup:** calibration, adapter identities, and physical-control lock details.
+
 ## Use simulation
 
-1. Open the dashboard and inspect raw encoder readings under **Joint data**.
+This station loads its saved calibration automatically. Move the right GELLO to
+control the right simulated arm. The left arm follows once its motor connection
+recovers. Absolute-zero capture buttons are disabled for imported calibrations
+so they cannot overwrite the saved mapping.
+
+
+1. Open the dashboard and inspect raw encoder readings under **Arm data**.
 2. Keep both GELLO arms still and click **Preview GELLO motion from current pose**.
 3. Move either GELLO. Its changes in joint angles drive the corresponding
    simulated arm from its home pose. Gripper preview starts at half-open.
@@ -71,7 +90,7 @@ absolute hardware zero. Stale or incomplete encoder samples never update sim
 commands; the simulated arm holds its last target. Reset clears the preview
 mapping so you can capture a new starting pose.
 
-For absolute mapping, put the GELLO in its documented zero pose (six joints at
+On an uncalibrated station, put the GELLO in its documented zero pose (six joints at
 zero and gripper reference at 0.357 rad), then use **Capture absolute zero pose**.
 Verify joint signs and gripper endpoints in simulation. Do not capture an
 arbitrary resting pose as an absolute zero. Calibration is saved in the supplied
@@ -145,6 +164,15 @@ echo 1 | sudo tee \
   /sys/bus/usb-serial/devices/ttyUSB0/latency_timer \
   /sys/bus/usb-serial/devices/ttyUSB1/latency_timer
 ```
+
+The GELLO worker targets 400 Hz; physics runs independently at 100 Hz and the
+viewer publishes at up to 60 Hz. Measured Y3 read batches after setting 1 ms USB
+latency: median 0.98 ms, p95 1.83 ms over 100 batches at 2 Mbps. In-service rates
+vary with load and are displayed under Arm data. Y6 did not reply during the
+latest scan and needs its power/cabling checked.
+
+Camera previews are sent only while a client has Cameras selected. Capture
+continues at 30 fps. This reduces tunnel traffic when using the simulation.
 
 These settings may reset after reconnect/reboot. The reader uses sync reads when
 available and falls back to checked per-servo reads when sync transfers fail.

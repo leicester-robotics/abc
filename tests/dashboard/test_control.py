@@ -66,3 +66,26 @@ class ControlTests(unittest.TestCase):
     def test_feedback_loss_reports_fault(self):
         self.enable();self.adapter.stale=True;self.supervisor.tick(self.now)
         self.assertEqual(self.supervisor.mode,'fault')
+
+    def test_stop_is_latched_when_request_queue_is_full(self):
+        self.enable()
+        for _ in range(32):self.supervisor.request('enable','b')
+        self.supervisor.request('simulation','a')
+        self.supervisor.heartbeat('a',self.now)
+        self.supervisor.tick(self.now)
+        self.assertNotEqual(self.supervisor.mode,'teleop')
+
+    def test_failed_release_is_sticky_and_retains_adapter(self):
+        self.enable()
+        def failed_close():raise RuntimeError('release unconfirmed')
+        self.adapter.close=failed_close
+        self.request('release')
+        self.assertEqual(self.supervisor.mode,'fault')
+        self.assertIn('left',self.supervisor.adapters)
+        self.request('simulation');self.request('recover')
+        self.assertEqual(self.supervisor.mode,'fault')
+        self.request('connect');self.assertEqual(len(self.created),1)
+        self.adapter.close=lambda:None
+        self.request('release')
+        self.assertEqual(self.supervisor.mode,'simulation')
+        self.assertEqual(self.supervisor.adapters,{})

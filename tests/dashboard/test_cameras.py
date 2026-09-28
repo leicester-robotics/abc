@@ -43,3 +43,17 @@ class CameraTests(unittest.TestCase):
         worker.close()
         self.assertIsNotNone(buf.read())
         self.assertEqual(source.starts,1)
+
+    def test_cleanup_failure_does_not_kill_reconnect(self):
+        import time
+        class Disconnected(Source):
+            def read(self):raise RuntimeError('Device disconnected. Failed to reconnect')
+            def close(self):raise RuntimeError('stop() cannot be called before start()')
+        sources=[Disconnected(),Source()];buf=LatestSample()
+        worker=CameraWorker(CameraConfig('a','top'),buf,source_factory=lambda:sources.pop(0))
+        worker.start()
+        deadline=time.monotonic()+2.
+        while buf.read() is None and time.monotonic()<deadline:time.sleep(.01)
+        # Avoid explicit close rethrow masking the worker failure assertion.
+        self.assertIsNotNone(buf.read())
+        worker.close()
