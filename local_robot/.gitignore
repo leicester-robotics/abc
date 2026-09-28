@@ -1,0 +1,5 @@
+hardware_deps/
+scripted_sessions/
+__pycache__/
+tests/__pycache__/
+.lance-deps/

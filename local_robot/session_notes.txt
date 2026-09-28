@@ -1165,3 +1165,26 @@ file on disk is that complete version.
 - No git commit.
 
 End of notes.
+
+Follow-up: live DiT/VLA checks (27 September 2026)
+------------------------------------------------
+- VLA command: uv run python -m local_robot.run_policy --policy=vla --prompt='pick up the cube'
+  Add --debug for no arm motion. Live startup moves to init_q before inference.
+- User observed DiT extending forward without reaching toward the cube;
+  VLA mostly held still. Task/scene mismatch is a hypothesis, not a confirmed
+  cause. The bottles DiT checkpoint is not trained for cube pickup.
+- Code inspection found matching left-then-right arm ordering, normalized
+  grippers (0 closed, 1 open), and top/left/right RGB camera mappings.
+  Physical CAN identity and gripper calibration were not independently tested.
+- Camera check: after stopping yam-harness, the launcher reached init_q and
+  stayed IDLE. Top and right wrist saw the cube clearly; left wrist saw it
+  partly clipped at the right edge. No obvious camera swap/inversion was seen.
+  Reset feedback differed from target by at most 0.0462 rad left / 0.0424 rad
+  right. Exact camera mounting equivalence to training remains unverified.
+  No policy action chunks were executed in this check; normal shutdown exited 0.
+- Next diagnostic (not yet performed): run the live VLA command, press a,
+  and inspect/copy the full first-action safety table before pressing Enter.
+  It compares measured starting joints with predicted targets. Tiny changes
+  suggest near-hold predictions; larger changes require comparing subsequent
+  measured motion with commands. The table alone does not test action tracking.
+  --debug uses a synthetic starting state and cannot validate hardware tracking.
