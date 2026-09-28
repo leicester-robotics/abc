@@ -36,6 +36,7 @@ class GelloReader(DeviceWorker):
         self.sync_factory = sync_factory
         self.connection = None
         self.sync = None
+        self._individual_reads = False
 
     def open(self):
         if self.connection_factory:
@@ -57,19 +58,32 @@ class GelloReader(DeviceWorker):
             raise
 
     def read_once(self):
-        if self.sync.txRxPacket() != 0:
-            raise ConnectionError('GELLO read failed; check power, baudrate, and servo IDs')
+        started = time.monotonic()
+        if not self._individual_reads:
+            result = self.sync.txRxPacket()
+            if result != 0:
+                if not hasattr(self.connection, 'packetHandler'):
+                    raise ConnectionError('GELLO read failed; check power, baudrate, and servo IDs')
+                self._individual_reads = True
         counts = []
         for motor_id in self.config.servo_ids:
-            if not self.sync.isAvailable(motor_id, 132, 4):
-                raise ConnectionError(f'No fresh position from servo {motor_id}')
-            value = self.sync.getData(motor_id, 132, 4)
+            if self._individual_reads:
+                value, result, error = self.connection.packetHandler.read4ByteTxRx(
+                    self.connection.portHandler, motor_id, 132)
+                if result != 0 or error != 0:
+                    raise ConnectionError(f'Invalid encoder reply from servo {motor_id}: {result}/{error}')
+            else:
+                if not self.sync.isAvailable(motor_id, 132, 4):
+                    raise ConnectionError(f'No fresh position from servo {motor_id}')
+                value = self.sync.getData(motor_id, 132, 4)
             counts.append(value - 2**32 if value >= 2**31 else value)
         counts = np.array(counts)
         self.buffer.publish(LeaderSample(
-            acquired_at=time.monotonic(), position=map_encoder(counts, self.config),
+            acquired_at=started, position=map_encoder(counts, self.config),
             counts=counts, radians=encoder_radians(counts), calibrated=self.config.calibrated,
-            raw={'servo_ids': self.config.servo_ids, 'device': self.config.device},
+            raw={'servo_ids': self.config.servo_ids, 'device': self.config.device,
+                 'read_mode': 'individual' if self._individual_reads else 'sync',
+                 'read_ms': round((time.monotonic()-started)*1000, 2)},
         ))
 
     def _close_device(self):

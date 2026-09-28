@@ -16,3 +16,14 @@ class YamTests(unittest.TestCase):
         cap.publish(5.,np.zeros(7),np.zeros(7),np.zeros(7),{})
         self.assertEqual(cap.read().acquired_at,5.)
         self.assertEqual(cap.read().acquired_at,5.)
+
+    def test_unverified_driver_cannot_energize_hardware(self):
+        from deploy.dashboard.yam import YamAdapter
+        from deploy.dashboard.config import ArmConfig
+        from unittest.mock import patch
+        cfg=ArmConfig('left','test',list(range(7)),[1]*7,[0.]*7,True,'can0')
+        adapter=YamAdapter(cfg)
+        with patch('i2rt.robots.get_robot.get_yam_robot') as factory:
+            with self.assertRaisesRegex(RuntimeError,'release'):
+                adapter.connect()
+            factory.assert_not_called()

@@ -47,6 +47,14 @@ class PassiveYamWorker(DeviceWorker):
             self.context = None
 
 
+PHYSICAL_BLOCKER = (
+    'Physical connection locked: the installed i2rt driver does not confirm torque '
+    'release or clean up partial initialization. Its gripper-calibration import also '
+    'bypasses the repository patch. A verified driver lifecycle is required before '
+    'energizing YAM; simulation, cameras, and passive telemetry remain available.'
+)
+
+
 class YamAdapter:
     """Capture timestamps where the motor thread publishes a complete feedback batch.
 
@@ -62,6 +70,8 @@ class YamAdapter:
         self._original_update = None
 
     def connect(self):
+        if self.factory is None:
+            raise RuntimeError(PHYSICAL_BLOCKER)
         if not self.config.mapping_verified or not self.config.calibrated:
             raise RuntimeError('Verify station mapping and calibration before connecting')
         if self.factory is None:

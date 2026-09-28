@@ -47,3 +47,13 @@ class GelloTests(unittest.TestCase):
         reader.open(); reader.read_once(); reader.close()
         self.assertIsNone(buf.read().position)
         np.testing.assert_equal(buf.read().counts,2048)
+
+    def test_sequential_fallback_reads_every_servo(self):
+        class Packet:
+            def read4ByteTxRx(self,port,motor,address):return 2048+motor,0,0
+        conn=Connection();conn.packetHandler=Packet();conn.portHandler=object()
+        sync=Sync();sync.result=1;buf=LatestSample()
+        reader=GelloReader(self.cfg,buf,connection_factory=lambda:conn,sync_factory=lambda c,ids:sync)
+        reader.open();reader.read_once();reader.close()
+        np.testing.assert_equal(buf.read().counts,np.arange(7)+2048)
+        self.assertEqual(buf.read().raw['read_mode'],'individual')

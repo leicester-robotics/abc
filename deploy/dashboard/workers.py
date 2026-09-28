@@ -21,7 +21,10 @@ class DeviceWorker:
                 self.open()
                 while not self._stop.is_set():
                     start = time.monotonic()
-                    self.read_once()
+                    try:
+                        self.read_once()
+                    except TimeoutError as error:
+                        self.buffer.set_error(str(error))
                     self._stop.wait(max(0., 1 / self.rate - (time.monotonic() - start)))
             except Exception as error:
                 self.buffer.set_error(f'{type(error).__name__}: {error}')

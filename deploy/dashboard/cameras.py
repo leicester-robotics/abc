@@ -37,7 +37,12 @@ class RealSenseSource:
         self.colorizer = rs.colorizer()
 
     def read(self):
-        frames = self.pipeline.wait_for_frames(timeout_ms=500)
+        try:
+            frames = self.pipeline.wait_for_frames(timeout_ms=500)
+        except RuntimeError as error:
+            if 'Frame didn' in str(error):
+                raise TimeoutError('Waiting for camera frames') from error
+            raise
         color = frames.get_color_frame()
         if not color:
             raise RuntimeError('No RGB frame')

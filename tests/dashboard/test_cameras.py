@@ -25,3 +25,21 @@ class CameraTests(unittest.TestCase):
         worker.open(); worker.read_once(); worker.close()
         self.assertIsNone(buf.read().depth)
         self.assertEqual(buf.read().depth_status,'unavailable')
+
+    def test_transient_frame_timeout_keeps_pipeline_open(self):
+        import time
+        class WarmingSource(Source):
+            starts=0;reads=0
+            def start(self):self.starts+=1
+            def read(self):
+                self.reads+=1
+                if self.reads==1:raise TimeoutError('warming up')
+                return super().read()
+        source=WarmingSource();buf=LatestSample()
+        worker=CameraWorker(CameraConfig('a','top'),buf,source_factory=lambda:source)
+        worker.start()
+        deadline=time.monotonic()+.5
+        while buf.read() is None and time.monotonic()<deadline:time.sleep(.01)
+        worker.close()
+        self.assertIsNotNone(buf.read())
+        self.assertEqual(source.starts,1)

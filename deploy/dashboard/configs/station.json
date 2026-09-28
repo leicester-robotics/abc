@@ -1,0 +1,86 @@
+{
+  "arms": [
+    {
+      "side": "left",
+      "device": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO6Y6-if00-port0",
+      "servo_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "signs": [
+        1,
+        -1,
+        -1,
+        -1,
+        1,
+        1,
+        1
+      ],
+      "offsets": null,
+      "mapping_verified": false,
+      "channel": "can_l_foll",
+      "gripper_type": "linear_4310",
+      "gripper_range": [
+        -0.6040225,
+        0.33736414
+      ],
+      "baudrate": 2000000
+    },
+    {
+      "side": "right",
+      "device": "/dev/serial/by-id/usb-FTDI_USB__-__Serial_Converter_FTBEO6Y3-if00-port0",
+      "servo_ids": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "signs": [
+        1,
+        -1,
+        -1,
+        -1,
+        1,
+        1,
+        1
+      ],
+      "offsets": null,
+      "mapping_verified": false,
+      "channel": "can_r_foll",
+      "gripper_type": "linear_4310",
+      "gripper_range": [
+        -0.6040225,
+        0.33736414
+      ],
+      "baudrate": 2000000
+    }
+  ],
+  "cameras": [
+    {
+      "serial": "427622271843",
+      "label": "Camera 1",
+      "depth": true
+    },
+    {
+      "serial": "427622273082",
+      "label": "Camera 2",
+      "depth": true
+    },
+    {
+      "serial": "427622272514",
+      "label": "Camera 3",
+      "depth": true
+    }
+  ],
+  "model_path": "abc_sim/models/yam_bimanual_empty.xml",
+  "asset_dir": "/home/tarik/code/abc/abc_sim/models/assets/i2rt_yam/assets",
+  "port": 8081
+}
