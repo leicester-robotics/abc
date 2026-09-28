@@ -218,6 +218,10 @@ PROFILES = {
     ),
 }
 
+from deploy.robot.local_profiles import build_local_profiles  # noqa: E402
+
+PROFILES.update(build_local_profiles(_profile, _DEFAULT_INIT_Q))
+
 DEFAULT_PROFILE = "bbox_config"
 
 

@@ -1,0 +1,1167 @@
+ABC local-robot policy session notes
+Date of the conversation: Sunday 27 September 2026
+Station: local YAM, profile local_yam_config
+Machine: NVIDIA GeForce RTX 4070 Laptop GPU, 8188 MiB; 31 GB system RAM; ~703 GB free disk
+Repo: /home/tarik/code/abc
+This file is a reconstruction of the chat plus the files that landed under local_robot/.
+No git commit was requested or made. Measurements below are only those that were
+actually reported by a run or written into the code/README. Items that were only
+discussed and not measured are labeled as such.
+
+========================================================================
+1. Goal of the session
+========================================================================
+
+Run the smallest published pretrained ABC policy on the already-connected local
+YAM robot, with a text prompt, and later also run ABC-VLA on the same 8 GB GPU.
+
+Station facts from AGENTS.md and deploy/robot/local_profiles.py:
+
+- ROBOT_PROFILE=local_yam_config
+- CAN: can_l_foll = left follower, can_r_foll = right follower, 1 Mbit/s
+- Udev names the buses by adapter serial. Backup rules: local_robot/99-can-up.rules
+- If a bus is DOWN: sudo bash deploy/scripts/reset_all_can.sh
+- Camera serials (top, left wrist, right wrist), all RealSense D405:
+    427622273082, 427622272514, 427622271843
+- No GELLO leaders on this station (leader_devices empty)
+- Follower CAN USB serials: left 205434A258455017, right 209037804546500A
+- Assume the robot starts in its base pose with safe support
+- Keep changes out of upstream/forked code. Put station-specific code in
+  local_robot/ (or local_profiles.py). One exception is already in the tree:
+  deploy/robot/config.py gained four lines that import local_profiles and
+  merge local_yam_config into PROFILES. That edit was already present when
+  the camera agent looked; it was not made by the agents in this chat, and
+  ROBOT_PROFILE=local_yam_config does not work without it.
+
+At the start of the chat, git status showed only untracked AGENTS.md and
+local_robot/tests/test_lift_both.py. Everything else described here was added
+during the chat or was already dirty from another terminal.
+
+Other files already under local_robot/ (lift_both, read_joints, snap_cameras,
+gripper_identify, astra.py, cube preview, and so on) were not part of this
+policy conversation. They are station tools. This document does not cover them
+except to say they exist.
+
+========================================================================
+2. Model choice
+========================================================================
+
+Two published policy families exist. prepare.py downloads them.
+
+ABC-DiT XL (chosen first, and it is the smallest published model):
+
+- Every published DiT checkpoint is the same architecture.
+- Built on CPU with no weights: "DiTPolicy built: 2.016B params"
+  (command: CUDA_VISIBLE_DEVICES= uv run python -m abc_minimal.dit)
+- Checkpoint used: cache/bottles_75k.pt
+  prepare.py key: checkpoints/bottles_release_prep_75k.pt
+  Size on disk: about 8.1 GB fp32 (download reported 8063.0 MB)
+- Download command that was run: uv run prepare.py --checkpoint
+  It also unpacked bottles_in_bin_preview.tar (161.9 MB) and norm_stats.json
+  into cache/ (train_real, val_real, train_sim, val_sim previews).
+- Download rate was roughly 50-60 MB/s and finished during the chat.
+- Vision: DINOv3 ViT-B/16, bundled in the checkpoint (no separate DINO download
+  for this eval checkpoint).
+- Text: OpenAI CLIP ViT-B/32 text tower, 512-d normalized embedding.
+  abc_minimal/dit.py task_name_to_prompt / CLIPTextEmbedder.
+  Any free-form English string can be encoded. Quality is only expected near
+  the training distribution. bottles_75k was trained for putting plastic
+  bottles in a bin (README prompt: "throw plastic bottles in bin").
+  A prompt like "pick up the cube" will run, but the policy was not trained
+  for that scene.
+- Actions: 14-d (6 joints + gripper, both arms), chunks of future joint targets.
+  Default diffusion / flow steps in deploy: 10. This session used 5.
+- DiT shape from abc_minimal/config.py DiTConfig: hidden 1536, depth 32,
+  24 heads. There is a smaller head config (hidden 512, depth 8) used by the
+  VLA action head, not as a standalone pretrained DiT.
+- DAgger checkpoints (folding_paper_box, insert_earbuds_1eb, insert_earbuds_3eb,
+  using_a_key, pack_student_bag) are the same ~8.1 GB DiT. They were finetuned
+  on the authors' station, some with 2x arm stiffness and a task-specific
+  --init-q. They were not downloaded in this chat. prepare.py --dagger-checkpoint
+  NAME prints the deploy command.
+
+ABC-VLA (requested later, not the small model):
+
+- Gemma 3 4B + SigLIP at 224, plus a small AdaLN DiT action head.
+- Upstream README: inference wants about 24 GB of GPU. This laptop has 8 GB.
+- Checkpoint: cache/vla_abc130k_200000_v2.pt via uv run prepare.py --vla-pretrained
+  (a background prepare was observed running during the camera fix).
+- V2 checkpoints embed norm_stats.
+- Chunk length 30. RTC prefix plus execute-chunk-dim must stay <= 30.
+- Prompt is tokenized by the Gemma preprocessor, not CLIP. Live prompt changes
+  still work; the 1.3 GB token embedding table stays on CPU and text embeddings
+  are cached until the prompt changes (a few milliseconds). Image tokens change
+  every observation, so attention KV cannot be cached across frames.
+- Gemma weights are under the Google Gemma Terms of Use.
+
+Why DiT first: it is the only smaller published policy. VLA does not fit in
+fp32 or even fully in bf16 on 8 GB without offload (bf16 Gemma is on the order
+of 8 GB of weights before activations).
+
+========================================================================
+3. Why the stock server cannot load DiT on this GPU
+========================================================================
+
+Stock entry point: deploy/serve_policy.py
+It builds deploy.policy.Policy -> abc_minimal.policy.DiTInferencePolicy.
+
+The constructor does this before any cast:
+
+    self.model = DiTPolicy(self.model_config).to(self.device)
+    ckpt = load_pretrained(self.model, checkpoint)
+
+2.016e9 parameters times 4 bytes is about 8.06 GB of fp32 weights, on an
+8188 MiB GPU that also runs the display. Activations need more on top.
+This was reasoned from the parameter count and the source. The stock server
+was NOT launched to confirm an out-of-memory error.
+
+--policy.fast-inference does cast to bf16 and torch.compile sample_actions,
+but only AFTER the fp32 model is already on the GPU (see
+DiTInferencePolicy._compile_for_fast_inference). It also compiles, which is
+slow. It does not solve the load.
+
+Why a separate file: AGENTS.md says preserve forked code and keep local
+changes separate. First workaround: local_robot/serve_bf16.py
+
+What serve_bf16.py does (still in the tree, still usable):
+
+- Subclasses DiTInferencePolicy.
+- Builds DiTPolicy on CPU (no .to(device) first).
+- load_pretrained on CPU.
+- model.to(dtype=torch.bfloat16).to(device), then img_backbone.set_bfloat16(True).
+- CLIP text embedder on GPU; task vector stored in bf16.
+- LivePromptPolicy overrides obs["prompt"] on every infer from a string that
+  a daemon thread reads from stdin (type a line, Enter).
+- Warmup: 3 dummy zero observations, then prints ms/chunk and peak allocated GPU.
+- Serves deploy.websocket_server.WebsocketPolicyServer on 0.0.0.0:8000.
+- Refuses nothing about fast_inference anymore (see agent 6). Originally main()
+  raised ValueError if --policy.fast-inference was set. That guard was removed
+  so DeployPolicy.__init__ can call enable_fast_inference. The extra bf16 cast
+  inside enable_fast_inference is a no-op on an already-bf16 model.
+
+Measured warmup of serve_bf16, zero images, 5 diffusion steps, GPU otherwise
+quiet enough to load:
+
+    [serve_bf16] warmup: 105 ms/chunk, 4.06 GiB peak GPU
+
+That test server was then killed so port 8000 was free. Later the user started
+their own serve_bf16 on port 8000 and agents were told not to kill it.
+
+serve_local.py later became the launcher default for both DiT and VLA.
+serve_bf16.py was left working. For DiT, serve_local reuses LivePromptPolicy
+from serve_bf16 (same bf16 load path).
+
+Control loop context used throughout:
+
+- Policy dt = 0.03333 s (30 Hz) in deploy/robot/config.py
+- RTC: next inference starts rtc_inference_lead_steps before the chunk ends.
+- Lead 7 was described in the README as a nominal ~233 ms budget
+  (7 * 33.33 ms). Profiling later measured the REAL window at about 211 ms
+  (6 sleeps of dt plus 7 short steps). See section 6.
+
+========================================================================
+4. Camera crash (SubscribeTimeout on camera:top)
+========================================================================
+
+User command (terminal 10), after the server was already up:
+
+    ROBOT_PROFILE=local_yam_config uv run deploy/deploy_policy.py \
+      --checkpoint-path=cache/bottles_75k.pt --remote-host=localhost \
+      --diffusion-steps=5--rtc --rtc-prefix-length=4 \
+      --rtc-inference-lead-steps=7 --execute-chunk-dim=16 \
+      --prompt='pick up the cube' --no-record --debug
+
+The pasted line shows --diffusion-steps=5--rtc with no space. The camera
+agent later found that tyro rejects that: invalid literal for int() with
+base 10: '5--rtc'. So the run that actually crashed must have had a space
+(--diffusion-steps=5 --rtc). The log shows "Policy server ready" and then:
+
+    deploy.robot.communication.SubscribeTimeout:
+    no message on camera:top within 500ms
+
+Stack: policy_rollout.run -> env.reset -> YAMEnv.get_obs -> _get_camera_obs
+-> comms.subscribe, timeout 500 ms. This is NOT a GPU or model failure.
+"Policy server ready" means the bf16 server had loaded.
+
+Root cause (agent 1): startup race.
+
+- All three D405s enumerated on USB3 (5 Gbit/s) behind one hub. Serials match
+  local_yam_config. Hardware was fine. Camera nodes did not crash.
+- Each camera's first frame arrives about 1.3 s after its process starts
+  (spawn, pyrealsense2 import, pipeline start).
+- deploy_policy starts cameras and the rollout together.
+- Because the policy server was already running, the rollout connected
+  immediately and called env.reset().
+- In --debug, reset skips the follower wait and reads each camera with a
+  fixed 500 ms timeout, so it failed on camera:top.
+- The agent reproduced the same error with the upstream script.
+
+Fix (upstream files not edited):
+
+- local_robot/policy_rollout.py monkeypatches YAMEnv.reset.
+  First reset subscribes to every camera with timeout 30_000 ms
+  (CAMERA_BOOTUP_TIMEOUT_MS) before the upstream reset.
+  Current code prints "Waiting..." / "All cameras publishing." only when
+  DEPLOY_VERBOSE is set. The agent's first verification printed those lines;
+  the verbose gate may have been tightened later. The wait itself is unconditional.
+- local_robot/deploy_policy.py is the upstream CLI, but it rewrites the
+  rollout process target from deploy.robot.gym.policy_rollout to
+  local_robot.policy_rollout.
+
+Verification (debug only, no arm motion): upstream script still failed the
+same way; the wrapper got through reset (all three cameras) to
+"IDLE — press a/b to start inference". Stopped with SIGINT. User's serve_bf16
+on port 8000 was left running.
+
+Corrected manual command (space restored, local entry point):
+
+    ROBOT_PROFILE=local_yam_config uv run python -m local_robot.deploy_policy \
+      --checkpoint-path=cache/bottles_75k.pt --remote-host=localhost \
+      --diffusion-steps=5 --rtc --rtc-prefix-length=4 \
+      --rtc-inference-lead-steps=7 --execute-chunk-dim=16 \
+      --prompt='pick up the cube' --no-record --debug
+
+--debug starts no follower processes and sets execute_actions=False, so it
+does not command the arms. Drop --debug only when you want motion.
+
+========================================================================
+5. Enter did nothing at the first-action safety check
+========================================================================
+
+After the camera fix, the user ran the local deploy command (with the space)
+in --debug, pressed a, got the FIRST RTC ACTION SAFETY CHECK table, and
+pressing Enter appeared to do nothing.
+
+The table they pasted (debug, so "Current" is init_q, not a live encoder read):
+
+    Max |delta| from current state: 0.0683 rad (3.9 degrees)
+    Action chunk shape: (16, 14)
+    Later steps in the chunk: about 0.006 to 0.012 rad (about 0.4 to 0.7 degrees)
+
+    L_J1 +0.5000 -> +0.5450, L_J2 +1.0000 -> +1.0130, L_J3 -1.0000 -> -0.9735
+    R_J3 -1.0000 -> -0.9317 was the largest single joint step (+0.0683)
+
+Those deltas are small. The safety check is still required before any
+non-debug execution.
+
+Root cause (agent 3), two layered problems:
+
+1. Cosmetic / misleading. With --no-record, both the rollout and
+   deploy/robot/key_listeners/key_listener.py read the same terminal.
+   The listener calls tty.setcbreak, which turns echo off, so Enter prints
+   no newline. After the prompt, the RTC loop prints nothing per chunk while
+   inference keeps up, and --debug moves nothing. The session looks frozen
+   even when it is running. The user's stuck session had actually passed the
+   prompt and executed 285 chunks; output continued on the prompt line.
+
+2. A real race. The listener polls the tty with select + read(1). If it wins
+   the Enter, it publishes key "\n", which nothing handles, and input() in
+   deploy/robot/gym/policy_safety.py blocks forever. Upstream has no handoff
+   that pauses the listener during the safety check.
+
+Fix, only in local_robot/policy_rollout.py, and only when the keyboard episode
+controller is active (--no-record / direct episode keys):
+
+- The safety table is still printed by the upstream function, with enter_prompt=None
+  so it does not call input().
+- Confirmation is read from the key listener's already-published key stream.
+- Keys typed before the table is shown are drained and do not count, except
+  shutdown keys (c/j) which abort.
+- Prompt text: "Press ENTER to execute, c/j to shut down, or Ctrl-C to abort > "
+- On Enter: "Confirmed. Executing; press a/b to stop and go home, c/j to shut down."
+- --record runs still use upstream input(), because that path does not share
+  the cbreak listener the same way (the recorder owns episode control).
+
+Verification via a pseudo-terminal (not by the user typing), --debug only:
+
+- a, then Enter, printed Confirmed. Executing.
+- b printed "Episode stopped by operator after 10 chunks", went home, IDLE.
+- c exited 0.
+- Ctrl-C or c at the prompt aborted before any chunk.
+- To free cameras, the agent SIGINT'd the user's stale debug session
+  (same as Ctrl-C). It did not kill the policy server on port 8000.
+- ruff was not installed, so that agent did not lint.
+
+The user's next real attempt (after this fix) did show:
+
+    Press ENTER to execute, c/j to shut down, or Ctrl-C to abort >
+    Confirmed. Executing; press a/b to stop and go home, c/j to shut down.
+    WARNING: Chunk 34: inference is still pending; the robot may pause between chunks.
+
+So Enter worked. The warning is section 6.
+
+========================================================================
+6. "inference is still pending" and the latency profile
+========================================================================
+
+Meaning: RTC starts the next inference near the end of the current chunk.
+If that inference is not finished when the chunk runs out, the robot waits.
+It is a timing stall, not a crash and not a bad action.
+
+Nominal README budget at lead 7: about 233 ms. Profiling measured the actual
+window at about 211 ms (6 sleeps of dt plus the short steps). In the user's
+live debug run, 80 percent of chunks landed at exactly 211-213 ms, which means
+inference had finished early and the loop was waiting on the control clock.
+
+Steady state, real 480x640 frames from all three D405s, user's live serve_bf16,
+5 diffusion steps, n=150 raw frames (agent 4):
+
+    End-to-end median 113.9 ms, p90 121.2 ms, max 258 ms
+    With --compress-images, n=100: median 106.8 ms, p90 114.7 ms, max 156 ms
+
+Ranked stages (median / p90 / max, milliseconds):
+
+    1. DiT sampler, 5 steps          95.8 / 97.3 / 104
+       19.2 ms per step, 0.59 ms per block
+    2. DINOv3 + pooling               6.2 / 6.5 / 11.8
+    3. Client msgpack pack            4.5 / 5.4 / 11.6
+       (0.36 ms if arrays are contiguous)
+    4. Websocket, 2.76 MB payload     2.1 / 2.8 / 3.7
+    5. Server CPU preprocess, 3 cams  2.1 / 2.3 / 2.6
+       (about 0.5 ms if done on GPU from pinned memory)
+    6. Camera read + obs assembly     0.7 / 0.8 / 1.4
+    7. Unpack, copy back, unnormalize, response pack  under 0.4
+    CLIP text                         0 when the prompt is unchanged (cached)
+
+Stage sum (~106 ms server time) matched measured server time (~108 ms).
+A second full copy of the model would not fit in the ~3.5 GB free while the
+user's server was loaded, so the GPU rows were measured on a real DiTPolicy
+built at depth 2 and depth 6 with random bf16 weights and extrapolated to
+depth 32. Treat the per-stage GPU split as an extrapolation; the end-to-end
+113.9 ms is a live measurement against the real server.
+
+Why the sampler dominates: each diffusion step reads about 3.8 GB of bf16 DiT
+weights at about 200 GB/s, about 78 percent of this GPU's peak bandwidth.
+Eager wall time roughly equals GPU time. Python and kernel launch are not
+the limit. Laptop was on AC. GPU clocks sagged from 2565 MHz to about 2130 MHz
+under a software power cap (~36 W during inference, 55 W cap when a second
+process was present). Memory clock stayed at 8001 MHz, so the sag matters
+little because the work is bandwidth-bound. CPU governor was powersave with
+EPP performance. No GIL issue: inference runs in the server event loop; the
+only other thread is the prompt reader. No GC or cuDNN autotune spikes were seen.
+
+Pending warnings were bursts, not a steady shortfall:
+
+- 15 of 74 chunks in one 40 s window, and 14 of 153 in another, all consecutive.
+- During a burst, a second CUDA process (/tmp/w8_triton2.py, the VLA agent's
+  int8 benchmark) pushed GPU memory from about 4.6 GB to 5.6 GB, utilization
+  to 100 percent, and power to the 55 W cap.
+- Probe requests jumped from ~108 ms to 222-250 ms at the same moment.
+- Outside bursts: zero overruns, max about 123 ms.
+
+So yes: the slowness the user saw (the pending warning at chunk 34, and the
+earlier warnings) was other GPU work, not the policy being too slow for the
+robot when the GPU is exclusive.
+
+Recommendations, by impact (agent 4). What was later adopted is in section 10.
+
+1. Keep the GPU to the policy server during rollouts. This removed every
+   overrun that was measured.
+2. If the GPU must be shared, --rtc-inference-lead-steps=10. Window grows to
+   about 318 ms (tolerates about 2.8x). Observations are about 100 ms staler.
+3. Compiled bf16: about -17 ms (16 percent) per chunk, extra VRAM under 0.1 GB
+   in the depth-2/6 measurement (max-autotune). NOT verified at depth 32 in
+   that pass, because of VRAM. The suggested code change was to delete the
+   ValueError guard in serve_bf16 main and pass --policy.rtc-prefix-length=4
+   so the RTC sampler compiles at startup. Compile was about 1 minute at
+   depth 6; several minutes were expected at full depth. Agent 6 later
+   measured full depth; see that subsection. Compile stayed opt-in.
+4. Fewer diffusion steps: about -20 ms per step removed (4 steps ~87 ms,
+   3 steps ~67 ms of sampler, from the extrapolation). Quality risk. The step
+   count that matters is the SERVER flag --policy.diffusion-steps. The robot
+   side --diffusion-steps is recorder metadata only.
+5. --compress-images: about -7 ms, payload 2.76 MB to about 19 KB. Caveat:
+   OpenCV resize without the server's antialiasing, JPEG quality 75.
+6. Not worth it: GPU preprocess / pinned memory (-1.7 ms), making client
+   arrays contiguous (-5 ms, and it would need an upstream edit), cudnn.benchmark
+   and TF32 (not measured; model is bf16 and the only conv is DINO patch embed).
+
+Profiling method: passive ZMQ listening plus scripts under /tmp/abc_prof/.
+No actions were sent. Probe requests to port 8000 were timed into the gap
+after the user's chunks. The user's server and debug rollout were left running.
+
+========================================================================
+7. Start pose
+========================================================================
+
+Yes. A policy should start from the pose it was trained from, and the deploy
+stack already does this for non-debug runs.
+
+YAMEnv.reset() (deploy/robot/gym/yam_env.py) commands each arm to
+config.robots[name].init_q before the episode.
+
+local_yam_config uses upstream _DEFAULT_INIT_Q, the same pose as the gtwy_config
+profile the upstream README uses for bottles_75k. Per arm, J0 through gripper:
+
+    [0.0, 0.5, 1.0, -1.0, 0.0, 0.0, 1.0]
+
+That is the "Current" column in the debug safety table. In --debug the arms
+are not moved, and _get_state_obs returns get_init_q(), so that column is the
+assumed pose, not a measurement.
+
+The physical arms rest near the base pose (joints near zero, per AGENTS.md).
+The first real episode therefore moves them from near zero to init_q:
+0.5 rad on J1 and 1.0 rad on J2 and J3. That first move is large even though
+the policy's first action relative to init_q was only 3.9 degrees.
+
+What upstream reset actually does (read by the launcher agent):
+
+- One follower interp command: a straight-line ramp of FOLLOWER_INTERP_S = 2.0 s
+  from wherever the arm is to init_q, no easing, whatever the distance.
+- From the base pose that is about 1 rad on J2/J3 at 0.5 rad/s, with an abrupt
+  start and stop.
+- After b (go home) from a far pose, the same 2 s interp can exceed 1 rad/s.
+- c/j shutdown moves the arms toward zero in 2 s from wherever they are.
+  Press b (home) before c, so that shutdown move is short.
+
+Gentle reset added later (local_robot/policy_rollout.py, env LOCAL_RESET_SPEED,
+set by run_policy --reset-speed, default 0.25):
+
+- Only when execute_actions is true (so --debug does not move arms).
+- Splits the move into several of the same 2 s ramps through waypoints.
+  segments = ceil(max |target-start| / (speed * 2.0)).
+- Default 0.25 rad/s: base pose to init_q is 2 ramps of 0.5 rad, about 4 s.
+- --reset-speed=0 or unsetting the env var keeps upstream behavior.
+- Running deploy_policy directly does not set the env var, so it stays upstream
+  unless you export LOCAL_RESET_SPEED.
+- The first-action safety check is unchanged and still happens after the move
+  to init_q, on the first policy chunk.
+- This gentle move has NEVER been executed on the real arms. All verification
+  was --debug or offline. Watch the first live reset. Keep a hand at the e-stop.
+
+Camera placement, table height, and objects matter more than the exact start
+pose for bottles_75k, because the checkpoint was trained on the authors'
+station. DAgger checkpoints need their own --init-q printed by prepare.py.
+Joint angles matching init_q does not fix a different camera rig.
+
+The preview episodes in cache/ could be checked for the recorded start pose.
+That comparison was offered in chat and was not done.
+
+========================================================================
+8. One-command launcher
+========================================================================
+
+User asked for one smooth way to run all of the above. Agent 5 built it.
+Agent 6 then pointed it at the VLA-capable server and added policy-aware defaults.
+Current behavior is what is in the files now (section 10 and agent 6).
+
+local_robot/run_policy.py:
+
+- Sets ROBOT_PROFILE itself (default local_yam_config; --profile overrides).
+- Preflight, read-only:
+    no other deploy/run_policy/dagger session
+    CAN links up (warning under --debug if not)
+    RealSense devices not held by another process (yam-harness serve is the
+    example called out) and on USB3
+    checkpoint exists and its sniffed kind matches --policy if given
+    port free, or an existing policy server on that port (websocket probe);
+    reuse does not stop that server; --no-reuse refuses instead
+    a non-policy process on the port is an error
+    free VRAM: default minimum 4.5 GiB for DiT, 2.9 GiB for VLA
+    other GPU processes above 256 MiB are warned
+- Starts local_robot.serve_local by default (--server-module can still be
+  local_robot.serve_bf16, which is refused for a VLA checkpoint).
+- Passes one set of flags to the server: checkpoint, policy type, diffusion
+  steps, prompt, port, rtc prefix, optional fast-inference, optional
+  --offload.quantize. --server-args may not repeat those managed flags.
+- Server stdout/stderr go to data/logs/server-*.log.
+- Prompt channel: the launcher owns the server's stdin pipe and listens on
+  the unix socket /tmp/abc-$USER/prompt-<port>.sock.
+  local_robot/set_prompt.py connects, sends one line, and the launcher writes
+  it to the server stdin, then waits until the log shows "[prompt] now:".
+  This works ONLY for a server the launcher started. A reused server: type
+  the prompt in that server's own terminal. set_prompt says so if the socket
+  is missing.
+  Recordings (if you drop --no-record) keep the launch --prompt, not later
+  live prompts.
+- Foreground: local_robot.deploy_policy with the same checkpoint and RTC flags.
+- On c/j, Ctrl-C, hangup, or a robot-side crash: stop the server child if
+  this launcher started it; do not stop a reused server; reap orphaned camera
+  and key-listener processes; restore the terminal.
+- Prints a banner: profile, checkpoint, prompt, log path, keys.
+
+Defaults now:
+
+    diffusion steps 5 (server)
+    RTC on, prefix 4
+    lead 7 and execute-chunk-dim 16 for DiT, and for VLA when the GPU is free
+    lead 10 and chunk 20 if VLA is auto-switched to int8 or the GPU is shared
+    --no-record
+    --reset-speed 0.25
+    prompt default if you omit --prompt: "throw plastic bottles in bin"
+    (the README examples pass "pick up the cube")
+
+Policy-aware VLA switch (run_policy._choose_rollout):
+
+- If other GPU compute apps exist, OR free VRAM is under 7.2 GiB, AND the
+  launcher is starting the server itself (not reusing one), AND the user did
+  not already pass --offload.quantize in --server-args:
+  it appends --offload.quantize=all and prints that it switched.
+- VLA bf16 on a shared GPU without that switch is warned: most Gemma layers
+  stream, about 450 ms/chunk, expect pending pauses.
+- --fast-inference is refused for VLA.
+- RTC check: 1 <= prefix <= lead < execute-chunk-dim, and prefix + chunk <= 30
+  (both DiT and VLA chunk_length used here is 30; DiTConfig and VLAModelConfig).
+
+Verification of the launcher (agent 5), --debug, pty, before VLA integration:
+
+- a, safety table, ENTER, 18 chunks, set_prompt changed the prompt (server log),
+  b, c, exit 0, terminal restored, nothing left running.
+- Ctrl-C mid-episode cleaned up.
+- Closing the terminal (hangup) still cleaned up orphaned camera nodes,
+  key listener, and the server.
+- A camera-busy failure (another harness grabbed a camera after preflight)
+  still stopped the server.
+- Not run: kill -9, and an end-to-end reuse of a real policy server (reuse
+  was tested with a stand-in).
+- An early port probe left one harmless traceback in the user's serve_bf16
+  terminal. The server kept running. The probe was fixed.
+- The gentle reset was not run on the arms.
+
+Agent 6's later debug end-to-end used synthetic camera frames because a real
+preflight refused (yam-harness held the cameras). See agent 6. Those runs
+also saw zero "pending" warnings.
+
+========================================================================
+9. VLA GPU/CPU offload
+========================================================================
+
+User asked for the serve script to also run ABC-VLA, with GPU/CPU offload,
+as efficient as this machine allows. Agent 2 built it without editing
+serve_bf16.py or any upstream file.
+
+Files:
+
+- local_robot/serve_local.py
+  Auto-detects dit vs vla via deploy.policy.selector.sniff_policy_kind
+  (--policy-type overrides). DiT uses LivePromptPolicy from serve_bf16.
+  VLA uses OffloadVLAInferencePolicy. Same stdin live prompt. Warmup prints
+  ms/chunk, peak allocated GPU, reserved GPU, pinned host bytes, and (after
+  agent 6) startup seconds and fast_inference flag.
+- local_robot/vla_offload.py
+- local_robot/bench_serve_local.py
+  Replays real frames from cache/val_real through the same policy object.
+  --save / --compare for action diffs. No robot.
+
+Design (why these choices):
+
+- Checkpoint is read on CPU with mmap. The model is built without allocating
+  full weights, then checkpoint tensors are dropped in. Gemma in the file is
+  already bf16. No full fp32 copy on CPU or GPU. Load about 2 s.
+- Per observation, Gemma + SigLIP run once. The small action head runs once
+  per diffusion step. So SigLIP, projections, state MLP, pooling, and the head
+  (fp32, matching upstream) always stay on the GPU.
+- Of 34 Gemma decoder layers, as many as fit stay resident. Budget is free
+  VRAM at startup minus --offload.reserve-gb (default 0.5), or an explicit
+  --offload.gpu-budget-gb.
+- The rest live in one exactly sized pinned CPU block and rotate through
+  2 preallocated GPU slots, copied on a side CUDA stream with events, spread
+  through the stack so the copy of the next layer overlaps compute. The
+  rotation carries across requests, so the first streamed layers of the next
+  request can load while the robot executes. Nothing is allocated or pinned
+  per request.
+- Prompt: 1.3 GB token table stays on CPU. Token ids, text embeddings, padded
+  ids, and masks are cached until the prompt changes.
+- int8 is weight-only, one scale per output row, plain PyTorch (Int8Linear).
+  torch._weight_int8pack_mm was about 55 ms per matmul on this GPU, so it was
+  not used. torch.compile of the int8 matmul was slower. Quantizing dequantizes
+  back to bf16 on the fly, which is why int8 can be SLOWER than resident bf16
+  when the GPU is free, and FASTER when the alternative is streaming many
+  bf16 layers over PCIe.
+- PCIe link measured Gen4 x8 at 12.6 GB/s. About 15 ms per bf16 layer and
+  7.5 ms per int8 layer of copy.
+- Outputs were checked identical across resident/streamed splits (bf16).
+  Cached prompt prep matched upstream exactly.
+- --offload.trim-padding (Gemma on 213 real tokens instead of 256) was tested,
+  outputs identical, only about 4 ms saved, left off by default.
+- int8 is off by default because it changes actions and is slower on a free GPU.
+
+Measured by agent 2. Real frames from val_real, 5 diffusion steps, RTC prefix.
+"Shared GPU" rows use a 2.4 GiB budget, which is what is left while a DiT
+server is also loaded. They are clean budget-limited runs, NOT runs next to
+the user's live server. Accuracy is the largest absolute action difference
+against the bf16 run. Action std was reported as 0.568.
+
+    Setup                                      ms/chunk   peak VRAM   pinned RAM   max |action diff|
+    DiT bf16                                   106-113    4.06 GiB    0            -
+    VLA bf16, free GPU (30 resident, 4 stream) 116        6.69 GiB    0.70 GiB     0 (identical)
+    VLA quantize=all, free GPU (all resident)  163        4.09 GiB    0            0.009
+    VLA bf16, shared budget (29 streamed)      456        2.29 GiB    5.10 GiB     0
+    VLA quantize=streamed, shared              236        2.33 GiB    2.46 GiB     0.013
+    VLA quantize=all, shared                   189        2.42 GiB    1.85 GiB     0.009
+
+Breakdown, free-GPU VLA bf16: image+prompt (mostly SigLIP) 31 ms, Gemma 76 ms,
+head 8 ms. Compute-only time 113 ms, so the 4 streamed layers are hidden.
+10 diffusion steps: 124 ms total on that setup.
+Shared-GPU bf16 is copy-bound: 5.1 GiB moved per chunk against 114 ms of compute.
+Shared-GPU int8 is mostly compute (dequant).
+Websocket round trip for the VLA: 117 ms.
+Host RAM excluding file cache: about 1.9 GiB with the GPU free, up to about
+7 GiB when fully streaming.
+Changing the prompt changed actions by 0.29-0.39 (VLA) and 0.2-1.06 (DiT).
+Outputs were finite, shape (30, 14) for the VLA.
+Both servers were brought up on port 8001, accepted a prompt from the terminal,
+and were stopped. No OOM.
+
+Robot-side flags agent 2 recommended (prefix + execute-chunk-dim <= 30):
+
+    Free GPU, DiT or VLA bf16:
+        --diffusion-steps=5 --rtc --rtc-prefix-length=4
+        --rtc-inference-lead-steps=7 --execute-chunk-dim=16
+    Shared GPU, VLA with --offload.quantize=all (~190 ms):
+        lead 10, execute-chunk-dim 20
+    Shared GPU, VLA bf16 streaming (~460 ms):
+        lead 16, execute-chunk-dim 22
+
+The launcher (agent 6) adopted the free-GPU pair (7, 16) and the int8 pair
+(10, 20). It does not automatically pick lead 16 / chunk 22; if you force
+bf16 streaming on a shared GPU it warns and still marks the rollout "slow"
+when shared, which selects (10, 20) unless you pass the lead/chunk yourself.
+Read the warning. Forcing full bf16 streaming (~450 ms) needs a larger lead
+than 10 if you want to avoid pauses. That combination was measured but is
+not the launcher default.
+
+Manual server commands (still valid; the launcher is preferred):
+
+    uv run python -m local_robot.serve_local \
+        --policy.checkpoint-path=cache/bottles_75k.pt \
+        --policy.diffusion-steps=5 --policy.rtc-prefix-length=4
+    uv run python -m local_robot.serve_local \
+        --policy.checkpoint-path=cache/vla_abc130k_200000_v2.pt \
+        --policy.diffusion-steps=5 --policy.rtc-prefix-length=4
+    # only when the GPU is shared:
+    #   add --offload.quantize=all
+
+========================================================================
+10. Current state of the tree (after integration)
+========================================================================
+
+Integration is DONE. It is not still in progress. Agent 6 finished and the
+files match its report. Nothing in this policy plan is left as an open
+coding task. What has NOT been done is a live arm-moving run of the launcher,
+and the gentle reset has not been executed on the real arms.
+
+What you run today, from the repo root. The launcher sets
+ROBOT_PROFILE=local_yam_config. Stop yam-harness first (it holds a camera;
+agent 6 saw pid 102457 on /dev/video10, and preflight refuses while a camera
+is busy). Stop any hand-started policy server if you want set_prompt to work.
+Do not run other GPU jobs during a rollout.
+
+    uv run python -m local_robot.run_policy --check --debug
+    uv run python -m local_robot.run_policy --prompt='pick up the cube' --debug
+    uv run python -m local_robot.run_policy --prompt='pick up the cube'
+
+    uv run python -m local_robot.run_policy --policy=vla --check --debug
+    uv run python -m local_robot.run_policy --policy=vla --prompt='pick up the cube' --debug
+    uv run python -m local_robot.run_policy --policy=vla --prompt='pick up the cube'
+
+    uv run python -m local_robot.set_prompt "put the cube in the bowl"
+
+Optional, DiT only, compiles at server start (cold ~345 s, cached ~47-65 s):
+
+    uv run python -m local_robot.run_policy --prompt='pick up the cube' --fast-inference --debug
+
+--debug first, every time you change flags. The live command without --debug
+MOVES THE ARMS, including the first reset from the base pose toward init_q.
+
+Safety:
+
+- E-stop within reach for the first live reset. The gentle move is new and
+  unverified on hardware. Default --reset-speed 0.25. --reset-speed=0 is the
+  old single 2 s ramp.
+- Read the safety table. Confirm with Enter only if the first-step deltas
+  look small (the bottles policy's first chunk vs init_q was 3.9 degrees max
+  in the debug run you already saw; a different prompt or a bad camera view
+  can be larger).
+- Press b (stop and go home) before c or j. Shutdown moves the arms toward
+  zero in 2 seconds from wherever they are.
+- Keep the GPU exclusive. Another CUDA process is what produced
+  "inference is still pending".
+- "pick up the cube" is a free-form CLIP/Gemma string. bottles_75k was trained
+  to throw plastic bottles in a bin. Expect poor behavior off that distribution
+  until you finetune. The VLA checkpoint is the abc130k 200k model; its prompt
+  in the upstream README example is "connect and route the hose". Same caveat.
+- If CAN is DOWN: sudo bash deploy/scripts/reset_all_can.sh
+- Keys: a start, b stop and home, c/j shut down, Enter confirms, Ctrl-C aborts.
+- Server logs: data/logs/server-*.log
+- --fast-inference is optional. Uncompiled DiT already finishes in ~107-114 ms
+  against a ~211 ms window (~100 ms spare). The compile saves roughly 13 ms.
+  It is off by default on purpose.
+- If the launcher prints that it switched the VLA to int8, that is because
+  free VRAM was under 7.2 GiB or another GPU process was present. Lead 10 and
+  chunk 20 are selected automatically. int8 changes actions by up to about 0.01.
+- --compress-images and --no-rtc and extra deploy flags (--init-q, --record,
+  --verbose) pass through. --record uses the upstream Enter path, not the
+  key-listener confirmation.
+
+Full-depth DiT compile, measured by agent 6 on an otherwise empty GPU
+(these numbers are in the README as well; README says cached startup 50-65 s,
+the agent report says 47-65 s and 94-96 ms):
+
+    uncompiled:     startup 9 s,  107 ms/chunk, 4.06 GiB
+    first compile:  startup 345 s, 94 ms/chunk, 4.12 GiB
+    cached compile: startup 47-65 s, 94-96 ms/chunk, 4.09 GiB
+    nvidia-smi peak including the desktop: 4.88 GiB, no OOM
+    A prompt change did not recompile.
+
+Debug end-to-end after integration used synthetic camera frames, because
+yam-harness held the real cameras and preflight correctly refused:
+
+    DiT uncompiled:          57 chunks, 0 pending warnings
+    VLA bf16:                116 ms, 6.69 GiB, 57 chunks, 0 pending
+    VLA int8:                160 ms, 4.32 GiB, lead 10 chunk 20, 46 chunks, 0 pending
+    DiT --fast-inference:    96 ms, server ready in 48 s, 57 chunks, 0 pending
+
+The shared-GPU auto-switch to int8 was unit-tested, not run as a live
+rollout beside another GPU process.
+
+deploy/robot/config.py still has the four-line local_profiles import.
+Agent 6 did not change config.py or local_profiles.py. They were already dirty.
+
+========================================================================
+11. Files created or changed in this chat
+========================================================================
+
+Created or substantially extended under local_robot/ for this policy work:
+
+    serve_bf16.py          DiT bf16 server, live stdin prompt. Guard that
+                           blocked --policy.fast-inference was removed by agent 6.
+    serve_local.py         DiT + VLA server. Default of run_policy.
+    vla_offload.py         Gemma layer residency, pinned streaming, int8, prompt cache.
+    bench_serve_local.py   Offline latency / VRAM / action-diff bench.
+    deploy_policy.py       Upstream CLI with the rollout target swapped.
+    policy_rollout.py      Camera boot wait, Enter via key listener, gentle reset.
+    run_policy.py          One-command preflight, server, deploy, cleanup.
+    set_prompt.py          Unix-socket prompt client.
+    README.md              "Run the policy" section and the file index.
+                           Also contains older lift/astra docs not from this chat.
+
+Not modified on purpose:
+
+    deploy/serve_policy.py, deploy/deploy_policy.py, abc_minimal/*, the rest of deploy/
+    except the pre-existing deploy/robot/config.py hunk:
+
+        from deploy.robot.local_profiles import build_local_profiles
+        PROFILES.update(build_local_profiles(_profile, _DEFAULT_INIT_Q))
+
+    local_profiles.py itself defines local_yam_config and was not rewritten
+    by these agents.
+
+No commits. No pushes.
+
+Temporary profiling scripts lived under /tmp/abc_prof/ and a pty driver under
+/tmp/run_policy_stub/. Those are not part of the repo.
+
+========================================================================
+12. Background agents
+========================================================================
+
+Six robot/policy agents ran in the background, in this order, plus this notes
+writer at the end. Each report below is the agent's own result, checked
+against the files where the integration changed them afterward.
+
+------------------------------------------------------------------------
+12.1  Fix top camera timeout
+      id: 73f89348-e70c-4810-9bcc-bb582ee49d28
+      status: success
+------------------------------------------------------------------------
+
+Asked to do:
+    Diagnose SubscribeTimeout on camera:top within 500 ms during
+    deploy_policy --debug, with serve_bf16 already on port 8000.
+    Fix without upstream edits if possible. Verify with --debug only.
+    Do not move the arms. Do not kill the user's server unless required.
+    Also explain the --diffusion-steps=5--rtc typo.
+
+What it actually did:
+    Enumerated the three D405s (USB3, 5 Gbit/s, one hub). Serials matched
+    local_yam_config. Timed first frame at about 1.3 s after process start.
+    Reproduced the upstream timeout when the policy server was already up,
+    because --debug reset does not wait on followers and the camera subscribe
+    timeout is 500 ms.
+    Confirmed tyro exits immediately on --diffusion-steps=5--rtc, so the
+    crashed run must have included a space.
+
+Files:
+    Created local_robot/policy_rollout.py (30 s wait on first reset).
+    Created local_robot/deploy_policy.py (swap rollout target).
+    Did not edit upstream. Noticed deploy/robot/config.py was already
+    modified (the 4-line local_profiles import) and that
+    prepare.py --vla-pretrained was running. Did not touch those.
+
+Verification:
+    --debug only. Confirmed debug starts no followers and execute_actions=False.
+    Upstream script: same SubscribeTimeout on camera:top.
+    Local wrapper: cameras publishing, reset succeeded, IDLE prompt reached.
+    SIGINT shutdown was clean. User's serve_bf16 on port 8000 left running.
+    Did not run the command without --debug.
+
+How it was used later:
+    Every later robot-side command went through local_robot.deploy_policy
+    and the camera wait. The launcher builds on this entry point.
+    The typo warning was repeated to the user: the flag needs a space.
+
+------------------------------------------------------------------------
+12.2  VLA GPU/CPU offload server
+      id: 20db0daf-153f-4764-a290-fd64de77edda
+      status: success
+------------------------------------------------------------------------
+
+Asked to do:
+    Extend the local server so ABC-VLA runs on the 8 GB GPU with CPU offload,
+    as efficiently as possible, without editing upstream, and without slowing
+    DiT. Keep live prompts. Measure latency, VRAM, RAM, and int8 accuracy.
+    Recommend robot-side RTC flags. Do not touch camera files. Use another
+    port if 8000 is taken. Dummy or recorded frames only, no arm motion.
+
+What it actually did:
+    Did not edit serve_bf16.py. Added serve_local.py, vla_offload.py, and
+    bench_serve_local.py. Implemented mmap load, resident SigLIP and head,
+    resident Gemma layers up to a VRAM budget, pinned double-buffered streaming
+    on a side CUDA stream, prompt embedding cache, stdin live prompt, auto
+    policy type, opt-in int8. Rejected torch._weight_int8pack_mm (about 55 ms
+    per matmul) and a compiled int8 matmul (slower). Left trim-padding off
+    after a 4 ms measurement.
+    Measured PCIe Gen4 x8 at 12.6 GB/s (about 15 ms per bf16 layer, 7.5 ms
+    per int8 layer).
+
+Measurements: see the table in section 9. Short form:
+
+    DiT                         106-113 ms, 4.06 GiB
+    VLA bf16 free GPU           116 ms, 6.69 GiB, 30/34 layers, action diff 0
+    VLA quantize=all free GPU   163 ms, 4.09 GiB, max action diff 0.009
+    VLA bf16 shared 2.4 GiB     456 ms, 2.29 GiB GPU, 5.10 GiB pinned, diff 0
+    VLA quantize=streamed share 236 ms, diff 0.013
+    VLA quantize=all shared     189 ms, diff 0.009
+    Websocket RTT VLA           117 ms
+
+    Shared-GPU rows were clean runs with a 2.4 GiB budget, not runs beside
+    the user's server. The user's DiT server and a debug deploy were using
+    the GPU during the first half of this work, which is also what caused
+    the pending-warning bursts in section 6 (this agent's /tmp/w8_triton2.py).
+
+Verification:
+    No OOM. Finite actions, shape (30, 14). Prompt change moves actions.
+    Servers on port 8001 started and stopped. DiT path not slower than before.
+
+How it was used later:
+    serve_local became the launcher default (agent 6). The free-GPU flag pair
+    (lead 7, chunk 16) and the int8 pair (lead 10, chunk 20) became launcher
+    defaults. int8 stayed off unless the GPU is shared. The 456 ms streaming
+    number is why the launcher refuses to silently run bf16 VLA when under
+    7.2 GiB free.
+
+------------------------------------------------------------------------
+12.3  Fix ENTER at safety check
+      id: 452f19eb-965c-43c8-985f-4508f51ce9b8
+      status: success
+------------------------------------------------------------------------
+
+Asked to do:
+    Explain why Enter at "Press ENTER to execute" did nothing, and fix it
+    in local files only. Keep the safety check. Verify with a pty in --debug.
+    Do not kill the user's serve_bf16. Do not move arms.
+
+What it actually did:
+    Read the key listener (cbreak, select, read(1)) and the safety prompt
+    (input()). Confirmed there is no upstream pause/handoff.
+    Found the user's apparently stuck session had executed 285 chunks.
+    Changed only the --no-record confirmation path in policy_rollout.py to
+    read Enter from the key listener stream. Updated the README entry for
+    policy_rollout.py.
+    SIGINT'd the user's stale debug session to free the cameras. Left the
+    server on port 8000 up. Noted pending warnings overlapped a GPU benchmark.
+
+Files:
+    local_robot/policy_rollout.py (confirmation path; gentle reset was NOT
+    in this change, that came in agent 5).
+    local_robot/README.md (policy_rollout description).
+
+Verification (pty, --debug):
+    a then Enter -> "Confirmed. Executing".
+    b -> stopped after 10 chunks, home, IDLE.
+    c -> exit 0.
+    Ctrl-C or c at the prompt -> abort before any chunk, clean exit.
+    No leftover processes.
+
+How it was used later:
+    The user reran and saw "Confirmed. Executing" plus the pending warning
+    at chunk 34, which triggered the profiling request.
+    The launcher uses this same rollout, so Enter behavior is unchanged.
+
+------------------------------------------------------------------------
+12.4  Profile inference latency bottleneck
+      id: b3b3e555-f09a-4032-861e-5a4cfb1aa8a6
+      status: success
+------------------------------------------------------------------------
+
+Asked to do:
+    Find the biggest bottleneck in one inference round trip, with real camera
+    frames if possible. Break down robot side, transport, server, and laptop
+    power state. Explain occasional vs constant pending warnings.
+    Do not edit serve_bf16.py (the VLA agent might be editing servers).
+    Do not move arms. Do not kill the user's server. Report recommended flags.
+
+What it actually did:
+    No source edits. Passive ZMQ plus /tmp/abc_prof scripts.
+    Live end-to-end against the user's server on port 8000, real 480x640 frames.
+    GPU stage split extrapolated from depth-2 and depth-6 bf16 models because
+    a second full model would not fit.
+    Observed the VLA agent's benchmark process during the bursts.
+
+Measurements: section 6. Headline:
+
+    Steady e2e median 113.9 ms vs real RTC window ~211 ms (not 233).
+    Biggest steady cost: DiT sampler ~96 ms, bandwidth bound.
+    Pending warnings only while another CUDA process shared the GPU
+    (latency 222-250 ms; 15/74 and 14/153 chunks).
+    --compress-images median 106.8 ms.
+    Compile estimate -17 ms, measured only at reduced depth.
+    About -20 ms per diffusion step removed.
+    Laptop on AC, software power cap, memory clock steady at 8001 MHz.
+
+Verification:
+    No arm commands. User's server and debug rollout left running.
+    Probe traffic was placed in the gap after the user's chunks.
+
+How it was used later:
+    Told the user the pending warning was GPU contention, and that exclusive
+    GPU is the fix. Lead 10, compile, fewer steps, and compress-images were
+    ranked and then partially adopted: exclusive GPU and the existing lead-7
+    default stayed; compile became opt-in --fast-inference after agent 6
+    measured full depth; compress-images stayed a flag, not a default.
+    The "~233 ms budget" wording in earlier chat was corrected to ~211 ms.
+
+------------------------------------------------------------------------
+12.5  One-command local robot launcher
+      id: 5b4b440e-4df4-4c94-8232-86663cd4ca28
+      status: success
+------------------------------------------------------------------------
+
+Asked to do:
+    One command that preflights, starts the server, runs deploy in the
+    foreground, supports prompt changes even though the key listener owns
+    the tty, checks whether reset() to init_q is abrupt and softens it if
+    needed, and shuts down cleanly. Do not edit serve_bf16.py or any
+    serve_*.py (VLA work was in flight). Invoke the server as a configurable
+    module, default serve_bf16 at that time. --debug / pty only. Do not kill
+    the user's server. Do not move arms.
+
+What it actually did:
+    Created run_policy.py and set_prompt.py.
+    Extended policy_rollout.py with the gentle reset (LOCAL_RESET_SPEED).
+    Added the README "Run the policy" section.
+    Did not edit serve_*.py.
+    Prompt design: launcher holds the child stdin; unix socket
+    /tmp/abc-$USER/prompt-<port>.sock; set_prompt sends a line; launcher
+    forwards it and waits for "[prompt] now:" in the server log.
+    Reused servers do not get this channel.
+    Documented upstream reset as one 2 s linear interp with no easing
+    (~0.5 rad/s from the base pose, abrupt start and stop). Home-on-b can
+    exceed 1 rad/s. c/j moves to zero in 2 s.
+    Gentle reset: several of those same 2 s ramps through waypoints, capped
+    at --reset-speed (default 0.25 rad/s). Base to init_q is 2 moves, about
+    4 s. --reset-speed=0 restores upstream. Direct deploy_policy is unchanged
+    unless the env var is set.
+    The gentle move was never executed on the real arms.
+
+Verification:
+    Pty --debug: a, safety table, ENTER, 18 chunks, prompt change, b, c,
+    exit 0, terminal restored, no stray processes.
+    Ctrl-C mid-episode: clean, server stopped.
+    Hangup: orphaned camera nodes, key listener, and server cleaned up.
+    Camera-busy crash after preflight: server still stopped, nothing left.
+    Preflight refusals checked: other debug session, yam-harness holding a
+    camera, non-policy process on the port, --no-reuse with a server present.
+    Not run: kill -9, and e2e reuse of a real policy server.
+    Early port check left one harmless traceback in the user's serve_bf16
+    terminal. Fixed afterward. Server kept running.
+    Default server module at the end of THIS agent was still serve_bf16.
+    Agent 6 changed the default to serve_local.
+
+How it was used later:
+    This is the command the user was told to run. Agent 6 retargeted the
+    server module and the RTC defaults without replacing the preflight,
+    prompt socket, or cleanup.
+
+------------------------------------------------------------------------
+12.6  Integrate VLA server into launcher
+      id: cbab90ef-e22b-4efa-bc68-d17f0a4e8559
+      status: success
+      This agent finished after the notes writer started. The tree was
+      re-read. The description here matches the files, not an earlier plan.
+------------------------------------------------------------------------
+
+Asked to do:
+    Make serve_local the launcher default. Single source of truth for
+    checkpoint, prompt, diffusion steps, and RTC prefix. --policy dit|vla.
+    Policy-aware lead/chunk. Auto int8 when the GPU cannot hold VLA bf16.
+    Opt-in --fast-inference for DiT, measured at full depth, not default
+    unless clearly worth the startup. Update README. Debug e2e for DiT and
+    VLA. Do not move arms. Do not kill user processes. Do not change
+    config.py or local_profiles.py.
+
+What it actually did (present in the files):
+
+    run_policy.py
+        --server-module default is local_robot.serve_local.
+        --policy dit|vla maps to cache/bottles_75k.pt and
+        cache/vla_abc130k_200000_v2.pt. --checkpoint-path overrides.
+        Kind is sniffed; --policy that disagrees with the file is refused.
+        serve_bf16 is refused for a VLA checkpoint.
+        Server command receives checkpoint, --policy-type, diffusion steps,
+        prompt, port, rtc prefix, optional --policy.fast-inference, and
+        --offload.quantize=all when auto-switched.
+        --server-args that repeat those flags are refused.
+        Free GPU (DiT, or VLA with >= 7.2 GiB free and no other GPU hogs):
+            lead 7, chunk 16.
+        Other GPU processes or < 7.2 GiB free, launcher starting the server:
+            --offload.quantize=all, lead 10, chunk 20, and a log line.
+        Minimum free VRAM to start a server: 4.5 GiB DiT, 2.9 GiB VLA.
+        prefix + execute-chunk-dim must be <= 30, and prefix <= lead < chunk.
+        --fast-inference is DiT only.
+        Server wait: 1800 s with --fast-inference, else 600 s.
+    serve_local.py and serve_bf16.py
+        The guard that raised on fast_inference was removed.
+        serve_local warmup/startup log includes fast_inference and startup seconds.
+        serve_bf16 itself has no extra compile logic; DeployPolicy.__init__
+        calls enable_fast_inference when the flag is set.
+    bench_serve_local.py
+        Prints startup time (as requested; the bench file's header documents
+        latency, VRAM, and --save/--compare).
+    README.md
+        "Run the policy" rewritten with DiT and VLA commands, the table of
+        ms/chunk and lead/chunk, compile startup times, set_prompt, and
+        safety notes.
+
+Full-depth compile on an otherwise empty GPU:
+
+    uncompiled startup 9 s, 107 ms/chunk, 4.06 GiB
+    first --fast-inference 345 s startup, 94 ms/chunk, 4.12 GiB
+    cached compile 47-65 s startup, 94-96 ms/chunk, 4.09 GiB
+    nvidia-smi peak 4.88 GiB including the desktop, no OOM
+    Prompt change did not recompile.
+    Left opt-in. About 13 ms saved. Uncompiled already fits the RTC window
+    with about 100 ms to spare. README states the same conclusion and quotes
+    cached startup as 50-65 s (agent report: 47-65 s).
+
+Debug end-to-end:
+    Real preflight refused because yam-harness pid 102457 held /dev/video10.
+    The e2e therefore used synthetic camera frames, not the three D405s.
+    DiT: 57 chunks, 0 pending.
+    VLA bf16: 116 ms, 6.69 GiB, 57 chunks, 0 pending.
+    VLA int8: 160 ms, 4.32 GiB, lead 10, chunk 20, 46 chunks, 0 pending.
+    DiT fast-inference: 96 ms, ready in 48 s, 57 chunks, 0 pending.
+    Shared-GPU auto-switch was unit-tested only.
+    Did not modify deploy/robot/config.py or local_profiles.py.
+
+How it was used:
+    This is the final user-facing interface. Section 10 is this result.
+    No further integration was pending when these notes were finished.
+
+------------------------------------------------------------------------
+12.7  Notes writer
+      id: 7559ae40-6c7d-4e0f-9f91-eb18b95d8581
+------------------------------------------------------------------------
+
+This agent only wrote local_robot/session_notes.txt. It did not start the
+robot, the policy server, or any other process, and it did not edit any
+other file. A second instruction arrived after the first draft was being
+prepared and before the file existed, asking for this background-agent
+section and for the integration (agent 6) to be treated as finished. The
+file on disk is that complete version.
+
+========================================================================
+13. Conversation order (what was asked, in short)
+========================================================================
+
+1. User: run the smallest pretrained model on the connected robot; which model;
+   how to run it.
+   Answer: ABC-DiT XL, bottles_75k.pt. Stock fp32 load does not fit in 8 GB.
+   Two-terminal plan: serve then deploy --debug, then drop --debug.
+
+2. User: try the small one (DiT XL) and add text input.
+   Done: download finished, serve_bf16.py with stdin prompts, warmup 105 ms
+   and 4.06 GiB. Commands given. Arms not moved by the assistant.
+
+3. User: why a new script; isn't there already a server?
+   Answer: deploy/serve_policy.py exists; it places fp32 weights on the GPU
+   first. Separate file because AGENTS.md says not to modify upstream.
+
+4. User pasted the camera:top timeout and asked why it cannot load on the GPU,
+   and to fix the timeout in parallel.
+   Answered the GPU question from the parameter count (stock server was not
+   run). Camera agent fixed the race.
+
+5. User: also run VLA with GPU/CPU offload, as efficient as possible.
+   VLA agent started. It overlapped the user's debug rollout and caused the
+   GPU contention measured later.
+
+6. Camera agent finished. User told to use local_robot.deploy_policy, keep
+   the space in --diffusion-steps=5 --rtc, and that config.py's 4 lines were
+   left in place because the profile needs them.
+
+7. User: Enter at the safety check does nothing.
+   Enter agent started. User told Ctrl-C was safe because --debug does not
+   move arms, and that the 3.9 degree first step looked small.
+
+8. Enter agent finished. User reran, saw Confirmed. Executing, then
+   "Chunk 34: inference is still pending", and asked why.
+   Answer at that moment: timing budget vs spikes, likely the VLA benchmarks.
+   Suggested --compress-images or a larger lead if it persisted.
+
+9. User: find the biggest bottleneck.
+   Profiling agent started.
+
+10. User: should the robot start in the policy's known initial state?
+    Answer: yes, and reset() already commands _DEFAULT_INIT_Q, same as
+    gtwy/bottles. First real move from the base pose is large. Cameras matter
+    more than a few degrees of start pose. DAgger checkpoints need their own
+    --init-q.
+
+11. User: given all of this, implement a smooth system and say how to run it.
+    Launcher agent started while profiling and VLA were still running, and
+    was told not to edit their files.
+
+12. Profiling agent finished. User was told: 114 ms steady, sampler is the
+    cost, pending warnings were the other GPU job. Compile change deferred
+    so it would not race the VLA edits.
+
+13. User: so the slowness is because another GPU job was running?
+    Answer: yes for the pending warnings. With the GPU alone, zero overruns
+    in the measured runs, worst about 123 ms. If the ARM looks slow aside
+    from those warnings, that is the policy, not inference.
+
+14. Launcher agent finished. Commands given: --check, --debug, live, set_prompt.
+    Caveat: stop yam-harness and the hand-started server; wait for VLA work
+    to finish before a live run; gentle reset unverified on hardware; b before c.
+
+15. VLA agent finished. 116 ms bf16 on a free GPU, identical to non-offload.
+    Integration agent started.
+
+16. User (this request): dump the whole conversation, in detail, into a txt
+    file, including every background agent. Integration had finished by the
+    time the file was written. Final commands are in section 10.
+
+========================================================================
+14. What was deliberately not done
+========================================================================
+
+- No live (non-debug) launcher run. No arm motion was commanded by any agent.
+- Gentle reset never ran on the hardware.
+- Stock deploy/serve_policy.py was never launched to capture a CUDA OOM.
+- DAgger checkpoints were not downloaded.
+- Preview episodes were not compared to _DEFAULT_INIT_Q.
+- --compress-images was not made the default.
+- --fast-inference was not made the default.
+- int8 was not made the default on a free GPU.
+- Full bf16 VLA streaming (lead 16, chunk 22) is documented but not what the
+  launcher selects; it auto-switches to int8 instead when VRAM is tight.
+- Shared-GPU auto-switch was unit-tested, not demonstrated beside a real
+  second CUDA process during a rollout.
+- Agent 6's end-to-end used synthetic frames because yam-harness held the
+  cameras. The earlier camera-wait and Enter fixes WERE verified against the
+  real D405s, in --debug, by agents 1, 3, and 5.
+- No git commit.
+
+End of notes.
