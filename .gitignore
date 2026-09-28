@@ -16,6 +16,8 @@ wandb/
 data/
 .python-version
 
-# Station measurements and GELLO runtime logs stay local.
-deploy/gello/calibrations/
+# Keep GELLO runtime logs local; finished calibration JSON files are versioned.
+deploy/gello/calibrations/live-encoders*.json
+deploy/gello/calibrations/*.jsonl
+deploy/gello/calibrations/*.progress.json
 .pytest_cache/

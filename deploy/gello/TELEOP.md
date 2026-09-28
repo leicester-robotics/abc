@@ -7,8 +7,8 @@ Gontrol; this path never enables leader torque or opens physical follower buses.
 ## Current station quickstart
 
 The measured `left.relative.json`, `right.json`, and `joint-envelope.json` were
-copied into `deploy/gello/calibrations/` on this workstation. This directory is
-Git-ignored: a fresh checkout needs its own calibration files. The left USB adapter
+copied into `deploy/gello/calibrations/` and are intended to be committed with the
+repository. They are specific to this station. The left USB adapter
 is FTBEO6Y3, the right FTBEO6Y6; both use 2 Mbps and IDs 1–7. After a power cycle,
 mode change, or torque enable resets the encoder counters, recapture calibration
 before using these saved references. Begin near the calibrated resting pose.
@@ -380,4 +380,3 @@ Recordings preserve interruption/failure status and refuse overwrites.
 No camera images are recorded; physical RealSense capture and the upstream
 training episode format remain a later integration. Recording/headless runs
 are bounded to ten minutes to bound in-memory storage.
-

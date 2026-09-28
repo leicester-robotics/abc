@@ -18,4 +18,4 @@ The upstream licenses are preserved beside the assets. ABC's existing
 Not migrated: unfinished gravity compensation/alignment models, gravity assistance
 experiments, RL/IK/training code, old upstream robot checkout, runtime logs, and
 calibration progress journals. The three finished station calibration/envelope
-files are copied locally into the ignored `calibrations/` directory.
+files are included in `calibrations/` for version control; runtime logs remain ignored.
