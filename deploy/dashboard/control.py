@@ -16,13 +16,24 @@ def checked(sample, now):
     q = np.asarray(sample.position, dtype=float)
     if q.shape != (7,) or not np.isfinite(q).all():
         raise ValueError('Expected seven finite joint values')
-    if np.any(q < LOW) or np.any(q > HIGH):
+    # Allow 0.01 rad encoder noise at a stop, but never command beyond the limits.
+    tolerance = np.array([.01]*6+[0.])
+    if np.any(q < LOW-tolerance) or np.any(q > HIGH+tolerance):
         raise ValueError('Joint target or observation exceeds limits')
-    return q
+    return np.clip(q, LOW, HIGH)
 
 
 class ControlSupervisor:
-    def __init__(self, arms, leaders, adapter_factory, clock=time.monotonic):
+    def __init__(self, arms, leaders, adapter_factory, clock=time.monotonic, require_support=False, home_on_connect=False, haptics=None, home_pose=None):
+        self.haptics = haptics or {}
+        self.force_feedback = True
+        self.home_pose = home_pose
+        self._leader_at_alignment = {}
+        self.home_on_connect = home_on_connect
+        self._alignment_goals = {}
+        self._alignment_then = 'teleop'
+        self.require_support = require_support
+        self._support_confirmed = {}
         self.arms = arms
         self.leaders = leaders
         self.adapter_factory = adapter_factory
@@ -37,6 +48,7 @@ class ControlSupervisor:
         self._requests = queue.Queue(maxsize=32)
         self._teleop_stop = threading.Event()
         self._release_uncertain = False
+        self._release_error = ''
         self._heartbeats = {}
         self._heartbeat_lock = threading.Lock()
         self._status_lock = threading.Lock()
@@ -85,7 +97,8 @@ class ControlSupervisor:
         self.error = reason
         if self._release_uncertain:
             self.mode = 'fault'
-            self.error = 'Robot release unconfirmed; retry release before recovery'
+            self.error = self._release_error or 'Robot release unconfirmed; retry release before recovery'
+            return
         for side, adapter in self.adapters.items():
             try:
                 sample = adapter.observe()
@@ -103,6 +116,17 @@ class ControlSupervisor:
                 self.error = f'Stop cannot be confirmed: {error}'
 
     def _action(self, action, client, now):
+        if action in ('haptics_on','haptics_off'):
+            if self.owner is not None and client != self.owner:
+                raise ValueError('Only the controlling browser can change force feedback')
+            self.force_feedback = action == 'haptics_on'
+            return
+        if action == 'confirm_support':
+            self._support_confirmed[client] = now
+            return
+        if action == 'cancel_support':
+            self._support_confirmed.pop(client, None)
+            return
         if action in ('simulation', 'disconnect'):
             if action == 'simulation' or client == self.owner:
                 self._hold(now)
@@ -125,6 +149,8 @@ class ControlSupervisor:
             self._hold(now)
             return
         if action == 'connect':
+            if self.require_support and not 0 <= now-self._support_confirmed.pop(client, -float('inf')) <= 30:
+                raise ValueError('Confirm arms supported and grippers clear immediately before connecting')
             if self.adapters or self.mode != 'simulation':
                 raise ValueError('Release the current connection before connecting again')
             if not self.arms:
@@ -149,22 +175,39 @@ class ControlSupervisor:
                 self._close_adapters()
                 self.mode = 'fault'
                 raise
+            if self.home_on_connect:
+                self._begin_alignment(client, self.clock(), follow=False)
             return
         if action != 'enable':
             raise ValueError(f'Unknown control action: {action}')
+        self._begin_alignment(client, now, follow=True)
+
+    def _begin_alignment(self, client, now, follow):
         if self.mode != 'holding':
             raise ValueError('Connect and hold the robot before enabling teleop')
         if not self._lease_valid(client, now):
             raise ValueError('Browser heartbeat missing')
+        needs_alignment = False
+        alignment_goals = {}
+        leader_at_alignment = {}
         for arm in self.arms:
-            target = self._leader(arm, now)
+            leader_at_alignment[arm.side] = self._leader(arm, now).copy()
+            target = leader_at_alignment[arm.side]
+            if not follow and self.home_pose is not None:
+                from .samples import ArmSample
+                target = checked(ArmSample(now,np.asarray(self.home_pose)),now)
             actual = checked(self.adapters[arm.side].observe(), now)
+            alignment_goals[arm.side] = target.copy()
             delta = np.abs(target-actual)
             self.alignment[arm.side] = delta.tolist()
-            if np.any(delta[:6] > .15) or delta[-1] > .1:
-                raise ValueError(f'{arm.side}: align GELLO within 0.15 rad and gripper within 0.1')
+            self.targets[arm.side] = actual.copy()
+            needs_alignment = needs_alignment or np.any(delta > .03)
         self.owner = client
-        self.mode = 'teleop'
+        self._leader_at_alignment = leader_at_alignment
+        self._alignment_goals = alignment_goals
+        self._alignment_then = 'teleop' if follow else 'holding'
+        self.mode = 'aligning' if needs_alignment else self._alignment_then
+        if self.mode == 'holding':self.owner = None
         self.error = ''
 
     def tick(self, now):
@@ -178,7 +221,7 @@ class ControlSupervisor:
                 except queue.Empty:
                     break
             self._hold(now)
-        if self.mode == 'teleop' and not self._lease_valid(self.owner, now):
+        if self.mode in ('aligning','teleop') and not self._lease_valid(self.owner, now):
             self._hold(now, reason='Browser disconnected or heartbeat expired')
         for _ in range(32):
             try:
@@ -191,6 +234,8 @@ class ControlSupervisor:
                 self._action(action, client, now)
             except Exception as error:
                 self.error = str(error)
+                import logging
+                logging.exception('Dashboard robot action %s failed',action)
         now = self.clock()
         for side, adapter in self.adapters.items():
             try:
@@ -200,23 +245,40 @@ class ControlSupervisor:
             except Exception as error:
                 self._hold(now, fault=True, reason=str(error))
                 break
-        if self.mode == 'teleop':
+        if self.mode in ('aligning','teleop'):
             try:
                 # Validate both arms before sending either command.
                 goals = {a.side: self._leader(a, now) for a in self.arms}
+                if self.mode == 'aligning':
+                    if any(np.max(np.abs(goals[s]-q))>.05 for s,q in self._leader_at_alignment.items()):
+                        self._hold(now, reason='Keep GELLO still during alignment; enable again to restart')
+                        self._publish()
+                        return
+                    goals = self._alignment_goals
+                speed = .25 if self.mode == 'aligning' else .5
                 for side, goal in goals.items():
-                    target = self.targets[side]+np.clip(goal-self.targets[side], -.5*dt, .5*dt)
+                    target = self.targets[side]+np.clip(goal-self.targets[side], -speed*dt, speed*dt)
                     self.adapters[side].command(target)
                     self.targets[side] = target.copy()
+                    self.alignment[side] = np.abs(goal-self.observations[side].position).tolist()
+                if self.mode == 'aligning' and all(np.max(delta)<=.03 for delta in self.alignment.values()):
+                    self.mode = self._alignment_then
+                    if self.mode == 'holding':self.owner = None
             except Exception as error:
                 self._hold(now, fault=True, reason=str(error))
         self._publish()
 
     def _publish(self):
+        from .haptics import reflected_current,HapticTarget
+        now=self.clock()
+        for arm in self.arms:
+            if arm.side not in self.haptics:continue
+            current=reflected_current(arm,self.observations.get(arm.side),now) if self.mode=='teleop' and self.force_feedback else None
+            self.haptics[arm.side].publish(HapticTarget(now if current is None else self.observations[arm.side].acquired_at,np.zeros(7) if current is None else current,enabled=current is not None))
         import copy
         with self._status_lock:
             self._published = copy.deepcopy(dict(mode=self.mode, owner=self.owner, error=self.error,
-                observations=self.observations, targets=self.targets, alignment=self.alignment))
+                observations=self.observations, targets=self.targets, alignment=self.alignment,force_feedback=self.force_feedback))
 
     def status(self):
         import copy
@@ -250,6 +312,7 @@ class ControlSupervisor:
             self.mode = 'fault'
             self.owner = None
             self.error = 'Robot release not confirmed: '+ '; '.join(errors)
+            self._release_error = self.error
             raise RuntimeError(self.error)
 
     def close(self):

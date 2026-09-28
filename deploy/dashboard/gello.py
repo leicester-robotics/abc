@@ -1,10 +1,11 @@
-"""Read-only GELLO acquisition: no mode, torque, or current writes."""
+"""GELLO acquisition with optional bounded haptics owned by the same serial thread."""
 from __future__ import annotations
 import glob
 import time
 import numpy as np
 from .samples import LeaderSample
 from .workers import DeviceWorker
+from .haptics import HapticOutput
 
 
 def encoder_radians(counts):
@@ -29,8 +30,12 @@ def calibration_offsets(counts, signs):
 class GelloReader(DeviceWorker):
     rate = 400.
 
-    def __init__(self, config, buffer, connection_factory=None, sync_factory=None):
+    def __init__(self, config, buffer, connection_factory=None, sync_factory=None, haptics=None):
         super().__init__(buffer)
+        self.haptics = haptics
+        self.haptic_output = None
+        self._haptic_previous = 0.
+        self._haptic_filtered = np.zeros(7)
         self.config = config
         self.connection_factory = connection_factory
         self.sync_factory = sync_factory
@@ -53,6 +58,8 @@ class GelloReader(DeviceWorker):
         else:
             from deploy.robot.leaders.dynamixel import Dynamixel
             self.connection = Dynamixel.Config(baudrate=self.config.baudrate, device_name=self.config.device).instantiate()
+        if self.haptic_output is not None:
+            self.haptic_output.connection = self.connection
         try:
             if self.sync_factory:
                 self.sync = self.sync_factory(self.connection, self.config.servo_ids)
@@ -87,18 +94,48 @@ class GelloReader(DeviceWorker):
                 value = self.sync.getData(motor_id, 132, 4)
             counts.append(value - 2**32 if value >= 2**31 else value)
         counts = np.array(counts)
+        self._update_haptics()
         self.buffer.publish(LeaderSample(
             acquired_at=started, position=self.mapper.map(counts * (np.pi / 2048.)) if self.mapper else map_encoder(counts, self.config),
             counts=counts, radians=encoder_radians(counts), calibrated=self.config.calibrated,
             raw={'servo_ids': self.config.servo_ids, 'device': self.config.device,
                  'read_mode': 'individual' if self._individual_reads else 'sync',
-                 'read_ms': round((time.monotonic()-started)*1000, 2)},
+                 'read_ms': round((time.monotonic()-started)*1000, 2),
+                 'haptics_active': bool(self.haptic_output and self.haptic_output.active),
+                 'haptic_current_ma': self.haptic_output.current.tolist() if self.haptic_output else [0]*7},
         ))
 
+    def _update_haptics(self):
+        now=time.monotonic()
+        command=self.haptics.read() if self.haptics is not None else None
+        valid=command is not None and command.enabled and 0<=now-command.acquired_at<=.1
+        if not valid:
+            if self.haptic_output is not None and (self.haptic_output.active or self.haptic_output.original):
+                self.haptic_output.close()
+            self._haptic_filtered[:]=0
+            self._haptic_previous=now
+            return
+        if self.haptic_output is None:self.haptic_output=HapticOutput(self.connection,self.config.servo_ids)
+        if not self.haptic_output.active:
+            if self.haptic_output.original:self.haptic_output.close()
+            self.haptic_output.enable()
+            self._haptic_previous=time.monotonic()
+            return
+        dt=now-self._haptic_previous
+        if dt<.03:return
+        self._haptic_filtered+=np.clip(command.current_ma-self._haptic_filtered,-25*min(dt,.1),25*min(dt,.1))
+        self.haptic_output.write(self._haptic_filtered)
+        self._haptic_previous=now
+
     def _close_device(self):
-        if self.connection is not None:
-            self.connection.disconnect()
-            self.connection = None
+        try:
+            if self.haptic_output is not None:
+                self.haptic_output.close()
+                self.haptic_output = None
+        finally:
+            if self.connection is not None:
+                self.connection.disconnect()
+                self.connection = None
 
 
 def discover_devices():

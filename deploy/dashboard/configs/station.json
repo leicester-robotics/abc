@@ -30,7 +30,7 @@
         1.5707963267948966,
         -3.141592653589793
       ],
-      "mapping_verified": false,
+      "mapping_verified": true,
       "channel": "can_l_foll",
       "gripper_type": "linear_4310",
       "gripper_range": [
@@ -38,7 +38,11 @@
         0.3390097541227237
       ],
       "baudrate": 2000000,
-      "calibration_path": "deploy/dashboard/calibrations/right.json"
+      "calibration_path": "deploy/dashboard/calibrations/right.json",
+      "robot_gripper_travel_range": [
+        4.5,
+        6.0
+      ]
     },
     {
       "side": "right",
@@ -70,7 +74,7 @@
         -0.0015339807878858025,
         -3.141592653589793
       ],
-      "mapping_verified": false,
+      "mapping_verified": true,
       "channel": "can_r_foll",
       "gripper_type": "linear_4310",
       "gripper_range": [
@@ -78,7 +82,11 @@
         3.4437868688032642
       ],
       "baudrate": 2000000,
-      "calibration_path": "deploy/dashboard/calibrations/left.relative.json"
+      "calibration_path": "deploy/dashboard/calibrations/left.relative.json",
+      "robot_gripper_travel_range": [
+        4.5,
+        6.0
+      ]
     }
   ],
   "cameras": [

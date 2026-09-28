@@ -22,6 +22,7 @@ class ArmConfig:
     gripper_range: list[float] = field(default_factory=lambda: [-0.6040225, 0.33736414])
     baudrate: int = 4_000_000
     calibration_path: str | None = None
+    robot_gripper_travel_range: list[float] | None = None
 
     @property
     def calibrated(self) -> bool:
@@ -72,6 +73,10 @@ def validate(cfg: DashboardConfig) -> DashboardConfig:
             raise ValueError('Gripper range must be two increasing finite radians')
         if arm.gripper_type not in ('linear_4310', 'crank_4310', 'linear_3507', 'flexible_4310'):
             raise ValueError('Unknown gripper type')
+        if arm.robot_gripper_travel_range is not None:
+            r=arm.robot_gripper_travel_range
+            if len(r)!=2 or not all(math.isfinite(v) for v in r) or not 0<r[0]<r[1]:
+                raise ValueError('Robot gripper travel range must contain two increasing positive radians')
         if arm.baudrate <= 0:
             raise ValueError('Baudrate must be positive')
     return cfg

@@ -74,8 +74,7 @@ handles to close. A later launch starts in simulation mode again.
 ## Use simulation
 
 This station loads its saved calibration automatically. Move the right GELLO to
-control the right simulated arm. The left arm follows once its motor connection
-recovers. Absolute-zero capture buttons are disabled for imported calibrations
+control the right simulated arm. The left GELLO controls the left simulated arm. Absolute-zero capture buttons are disabled for imported calibrations
 so they cannot overwrite the saved mapping.
 
 
@@ -98,33 +97,39 @@ configuration file, but robot control state is never saved.
 
 ## Physical control status
 
-**Physical connection and teleop are locked in this release.** The installed
-i2rt driver has these verified lifecycle problems:
+Physical control requires a verified isolated i2rt copy with the included lifecycle patch.
+Prepare it once, then launch with its path:
 
-- Its `MotorChainRobot.close()` calls a chain `close()` that only clears a running
-  flag; it does not confirm motor-off or close the CAN interface.
-- Its factory can energize motors before returning an object, leaving no object
-  for the caller to clean up if initialization fails.
-- Its gripper calibration imports the utility inside the constructor, bypassing
-  the repository's module-level calibration patch.
+```bash
+/home/tarik/code/abc/.venv/bin/python -m deploy.dashboard.driver_setup outputs/dashboard/sdk-v3
+DASHBOARD_SDK_DIR="$PWD/outputs/dashboard/sdk-v3" PYTHONPATH="$PWD/outputs/dashboard/sdk-v3" /home/tarik/code/abc/.venv/bin/python -m deploy.dashboard --config deploy/dashboard/configs/station.json
+```
 
-The dashboard displays the physical-control buttons and the lock reason. The
-production adapter rejects connection before constructing the controller.
-Removing the UI lock alone cannot energize hardware. Fixing and validating the
-installed driver lifecycle is required before physical commissioning; do not
-remove the backend guard to bypass it.
+The patch verifies motor disable acknowledgments, drains fault-clear responses,
+joins command threads before release, and retains ownership after partial startup.
+The shared installed SDK is unchanged. An unverified SDK keeps physical control locked.
 
-The supervisor has tested alignment checks (0.15 rad / 0.1 gripper), freshness
-checks (200 ms), target slew limits (0.5 rad/s and 0.5 gripper units/s), a per-browser
-lease (500 ms), and fault/hold transitions. Tests use fake adapters and do not
-establish physical safety. Its browser heartbeat uses the Viser client socket;
-hiding the controlling tab stops the heartbeat. No YAM controller is initialized
-by simulation, camera capture, calibration, or observation subscription.
+1. Support both arms and clear the grippers, then check the confirmation in Robot control.
+2. **Connect robot** calibrates gripper endpoints, moves to the saved home
+   `[0, 0, 0, 1.5708, 0, 0, 0.5]` at up to 0.25 rad/s, and holds.
+3. **Enable teleop** gradually aligns to GELLO, then follows at up to 0.5 rad/s.
+   Keep the leaders still during alignment and the controlling browser visible.
+4. **Simulation only** stops following and holds the physical arms.
+   **Release robot** disables their motors.
 
-Physical YAM telemetry subscribes to existing `follower_left_obs` and
-`follower_right_obs` ZMQ streams without starting a controller. If no observation
-publisher exists, the panel correctly shows unavailable. It does not display
-simulated values as physical readings.
+Force feedback defaults on and activates only during teleop. It reflects measured
+motor effort, including gravity and friction, with a 25 mA per-motor hardware cap,
+current ramping, a 100 ms freshness deadline, and a motor bus watchdog. The serial
+reader owns all leader writes and restores mode/current limits after disabling.
+This has offline coverage; physical haptic behavior still needs operator validation.
+
+The controller holds on stale feedback, loss of the 500 ms browser lease, or a
+moving leader during alignment. Startup does not enable following automatically.
+Gripper calibration holds the arm joints and checks both endpoints against the
+station's observed 4.5–6.0 rad travel range (historical station-shadow reports).
+
+Physical YAM telemetry comes from complete motor batches while connected, or
+existing follower ZMQ observations while disconnected.
 
 ## Dependencies and assets
 
@@ -142,7 +147,7 @@ python3 -m venv .venv-dashboard
 Run from the repo root. Obtain the YAM model assets using the repository's asset
 preparation instructions; `--asset-dir` points to the folder containing the STL
 files. `--model-path` selects a compatible bimanual YAM scene. `--demo` opens no
-hardware and labels its generated motion. i2rt is only needed for future physical
+hardware and labels its generated motion. i2rt is needed for physical
 controller integration; passive observation uses ZMQ.
 
 Use `python -m deploy.dashboard --discover` to list camera and USB identities.
@@ -168,8 +173,7 @@ echo 1 | sudo tee \
 The GELLO worker targets 400 Hz; physics runs independently at 100 Hz and the
 viewer publishes at up to 60 Hz. Measured Y3 read batches after setting 1 ms USB
 latency: median 0.98 ms, p95 1.83 ms over 100 batches at 2 Mbps. In-service rates
-vary with load and are displayed under Arm data. Y6 did not reply during the
-latest scan and needs its power/cabling checked.
+vary with load and are displayed under Arm data. Both adapters now provide live sync reads at approximately 380 Hz.
 
 Camera previews are sent only while a client has Cameras selected. Capture
 continues at 30 fps. This reduces tunnel traffic when using the simulation.

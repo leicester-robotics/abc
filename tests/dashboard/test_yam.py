@@ -27,3 +27,15 @@ class YamTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError,'release'):
                 adapter.connect()
             factory.assert_not_called()
+
+    def test_partial_production_connect_can_be_released(self):
+        from deploy.dashboard.yam import YamAdapter
+        from deploy.dashboard.config import ArmConfig
+        from unittest.mock import patch,Mock
+        cfg=ArmConfig('left','test',list(range(7)),[1]*7,[0.]*7,True,'can0')
+        lifecycle=Mock();lifecycle.connect.side_effect=RuntimeError('partial startup')
+        with patch('deploy.dashboard.yam.PHYSICAL_BLOCKER',''),patch('deploy.dashboard.physical.PhysicalConnection',return_value=lifecycle):
+            adapter=YamAdapter(cfg)
+            with self.assertRaisesRegex(RuntimeError,'partial startup'):adapter.connect()
+            adapter.close()
+        lifecycle.close.assert_called()

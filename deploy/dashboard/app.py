@@ -21,9 +21,9 @@ def ensure_port_free(port):
         sock.bind(('127.0.0.1',port))
 
 
-def make_workers(config, leaders, cameras, physical, demo=False):
+def make_workers(config, leaders, cameras, physical, demo=False, haptics=None):
     if demo:return []
-    return ([GelloReader(a,leaders[a.side]) for a in config.arms]
+    return ([GelloReader(a,leaders[a.side],haptics=(haptics or {}).get(a.side)) for a in config.arms]
             +[CameraWorker(c,cameras[c.serial]) for c in config.cameras]
             +[PassiveYamWorker(a.side,physical[a.side]) for a in config.arms])
 
@@ -47,8 +47,9 @@ def run(config, demo=False, config_path=None, status_path=None, stop_event=None)
     leaders={a.side:LatestSample() for a in config.arms}
     cameras={c.serial:LatestSample() for c in config.cameras}
     physical={a.side:LatestSample() for a in config.arms}
-    supervisor=ControlSupervisor(config.arms,leaders,YamAdapter)
-    workers=make_workers(config,leaders,cameras,physical,demo)
+    haptics={a.side:LatestSample() for a in config.arms}
+    supervisor=ControlSupervisor(config.arms,leaders,YamAdapter,require_support=True,home_on_connect=True,haptics=haptics,home_pose=config.simulation_home)
+    workers=make_workers(config,leaders,cameras,physical,demo,haptics)
     server=viser.ViserServer(host='127.0.0.1',port=config.port)
     if server.get_port()!=config.port:
         server.stop();raise OSError('Requested port occupied; refusing fallback port')
@@ -92,9 +93,14 @@ def run(config, demo=False, config_path=None, status_path=None, stop_event=None)
                     status={'mode':snapshot['control']['mode'],'error':snapshot['control']['error'],
                         'port':config.port,'simulation_time':float(render_data.time),'demo':demo,
                         'simulation_hz':snapshot['scene_rate'],
+                        'force_feedback':snapshot['control']['force_feedback'],
+                        'physical':{s:{'position':v.position.tolist(),'age':max(0.,now-v.acquired_at)} for s,v in snapshot['control']['observations'].items()},
+                        'alignment':snapshot['control']['alignment'],
                         'leaders':{s:{'age':max(0.,time.monotonic()-v.acquired_at) if v else None,'error':leaders[s].error,
                                       'rate_hz':leaders[s].rate_hz,'read_ms':v.raw.get('read_ms') if v else None,
                                       'read_mode':v.raw.get('read_mode') if v else None,
+                                      'haptics_active':v.raw.get('haptics_active',False) if v else False,
+                                      'position':v.position.tolist() if v is not None and v.position is not None else None,
                                       'counts':v.counts.tolist() if v is not None else None} for s,v in leader_samples.items()},
                         'cameras':{s:{'age':max(0.,time.monotonic()-v.acquired_at) if v else None,'error':cameras[s].error,
                                       'shape':list(v.rgb.shape) if v else None,'rate_hz':cameras[s].rate_hz} for s,v in snapshot['cameras'].items()}}

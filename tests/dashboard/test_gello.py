@@ -97,3 +97,51 @@ class GelloTests(unittest.TestCase):
         cfg=ArmConfig('right',cal.port,cal.ids,cal.signs+[1],calibration_path=path,baudrate=cal.baudrate)
         reader=GelloReader(cfg,LatestSample(),connection_factory=Connection,sync_factory=lambda c,ids:Sync())
         reader.open();reader.read_once();reader.close()
+
+    def test_haptics_expire_independently_of_position_reads(self):
+        from deploy.dashboard.haptics import HapticTarget
+        from unittest.mock import Mock,patch
+        import time
+        commands=LatestSample();output=Mock();output.active=False;output.original={};output.current=np.zeros(7)
+        def enable():output.active=True
+        def close():output.active=False
+        output.enable.side_effect=enable;output.close.side_effect=close
+        reader=GelloReader(self.cfg,LatestSample(),connection_factory=Connection,sync_factory=lambda c,ids:Sync(),haptics=commands)
+        with patch('deploy.dashboard.gello.HapticOutput',return_value=output):
+            reader.open();reader.read_once();output.enable.assert_not_called()
+            commands.publish(HapticTarget(time.monotonic(),np.ones(7)))
+            reader.read_once();self.assertTrue(output.active)
+            commands.publish(HapticTarget(time.monotonic()-1.,np.ones(7)))
+            reader.read_once();self.assertFalse(output.active)
+            reader.close()
+
+    def test_serial_port_closes_even_if_haptic_release_fails(self):
+        from unittest.mock import Mock
+        connection=Connection()
+        reader=GelloReader(self.cfg,LatestSample(),connection_factory=lambda:connection,sync_factory=lambda c,ids:Sync())
+        reader.open();reader.haptic_output=Mock()
+        reader.haptic_output.close.side_effect=RuntimeError('off ACK lost')
+        with self.assertRaisesRegex(RuntimeError,'off ACK lost'):reader._close_device()
+        self.assertTrue(connection.closed)
+
+    def test_reconnect_restores_pending_haptic_settings_before_enable(self):
+        from unittest.mock import Mock
+        from deploy.dashboard.haptics import HapticTarget
+        import time
+        commands=LatestSample();connections=[]
+        def connect():
+            c=Connection();connections.append(c);return c
+        reader=GelloReader(self.cfg,LatestSample(),connection_factory=connect,sync_factory=lambda c,ids:Sync(),haptics=commands)
+        reader.open();output=Mock();output.active=False;output.original={1:(3,100)}
+        reader.haptic_output=output;output.close.side_effect=RuntimeError('off ACK lost')
+        with self.assertRaises(RuntimeError):reader._close_device()
+        reader.open()
+        self.assertIs(output.connection,connections[-1])
+        self.assertTrue(connections[0].closed)
+        commands.publish(HapticTarget(time.monotonic(),np.ones(7)))
+        with self.assertRaises(RuntimeError):reader._update_haptics()
+        output.enable.assert_not_called()
+        def restored():output.original.clear()
+        output.close.side_effect=restored
+        reader._update_haptics();output.enable.assert_called_once()
+        reader.close()

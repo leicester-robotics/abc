@@ -47,12 +47,8 @@ class PassiveYamWorker(DeviceWorker):
             self.context = None
 
 
-PHYSICAL_BLOCKER = (
-    'Physical connection locked: the installed i2rt driver does not confirm torque '
-    'release or clean up partial initialization. Its gripper-calibration import also '
-    'bypasses the repository patch. A verified driver lifecycle is required before '
-    'energizing YAM; simulation, cameras, and passive telemetry remain available.'
-)
+from .physical import backend_blocker
+PHYSICAL_BLOCKER = backend_blocker()
 
 
 class YamAdapter:
@@ -66,17 +62,22 @@ class YamAdapter:
         self.config = config
         self.factory = factory
         self.robot = None
+        self.lifecycle = None
         self.capture = FeedbackCapture()
         self._original_update = None
 
     def connect(self):
-        if self.factory is None:
+        if self.factory is None and PHYSICAL_BLOCKER:
             raise RuntimeError(PHYSICAL_BLOCKER)
         if not self.config.mapping_verified or not self.config.calibrated:
             raise RuntimeError('Verify station mapping and calibration before connecting')
-        factory = self.factory
-        self.robot = factory()
         try:
+            if self.factory is None:
+                from .physical import PhysicalConnection
+                self.lifecycle = PhysicalConnection(self.config)
+                self.robot = self.lifecycle.connect()
+            else:
+                self.robot = self.factory()
             chain = self.robot.motor_chain
             self._original_update = chain._update_absolute_positions
             original = self._original_update
@@ -92,6 +93,7 @@ class YamAdapter:
                 self.capture.publish(now, remapper.to_command_joint_pos_space(positions),
                     remapper.to_command_joint_vel_space(velocity), effort,
                     {'motor_position_rad': positions.tolist(),
+                     'gripper_direction': int(np.sign(self.robot._gripper_limits[1]-self.robot._gripper_limits[0])),
                      'motor_errors': [f.error_code for f in feedback],
                      'temperature_rotor': [f.temperature_rotor for f in feedback],
                      'temperature_mos': [f.temperature_mos for f in feedback]})
@@ -122,9 +124,11 @@ class YamAdapter:
         self.command(target)
 
     def close(self):
-        if self.robot is not None:
-            # Only injected test/integration backends reach here. The installed production driver is blocked.
+        if self.lifecycle is not None:
+            self.lifecycle.close()
+            self.lifecycle = None
+        elif self.robot is not None:
             self.robot.close()
-            if self._original_update is not None:
-                self.robot.motor_chain._update_absolute_positions = self._original_update
-            self.robot = None
+        if self.robot is not None and self._original_update is not None:
+            self.robot.motor_chain._update_absolute_positions = self._original_update
+        self.robot = None

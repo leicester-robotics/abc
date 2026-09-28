@@ -1,0 +1,328 @@
+--- a/i2rt/motor_drivers/dm_driver.py
++++ b/i2rt/motor_drivers/dm_driver.py
+@@ -143,10 +143,17 @@
+         # dummy motor type just check motor status
+         motor_info = self.parse_recv_message(message, MotorType.DM4310, ignore_error=True)
+         if int(motor_info.error_code, 16) != MotorErrorCode.normal:
+-            while int(motor_info.error_code, 16) != MotorErrorCode.normal:
++            for _attempt in range(3):
++                if int(motor_info.error_code, 16) == MotorErrorCode.normal:
++                    break
+                 logging.info(f"motor {motor_id} error: {motor_info.error_message}")
+                 self.clean_error(motor_id=motor_id)
+-                self.try_receive_message()
++                # clean_error sends three commands; consume all their replies.
++                for _drain in range(100):
++                    if self.try_receive_message(timeout=.001) is None:
++                        break
++                else:
++                    raise RuntimeError("Fault-clear feedback did not drain")
+                 logging.info(f"motor {motor_id} error cleaned")
+                 # enable again
+ 
+@@ -183,6 +190,9 @@
+         id = self._get_frame_id(motor_id)
+         data = [0xFF] * 7 + [0xFD]
+         message = self._send_message_get_response(id, motor_id, data)
++        if (len(message.data) != 8 or (message.data[0] & 0x0F) != motor_id
++                or (message.data[0] >> 4) != 0):
++            raise RuntimeError(f"Motor {motor_id}: missing disabled-status acknowledgement: {message}")
+ 
+     def save_zero_position(self, motor_id: int) -> None:
+         """Save the current position as zero position.
+@@ -372,22 +382,24 @@
+         self.motor_direction = np.array(motor_direction)
+         self.channel = channel
+         logging.info(f"Channel: {channel}, Bitrate: {bitrate}")
++        self._interface_kwargs = dict(channel=channel, name=motor_chain_name,
++                                      use_buffered_reader=use_buffered_reader)
+         if "can" in channel:
+-            self.motor_interface = DMSingleMotorCanInterface(
+-                channel=channel,
+-                bustype="socketcan",
+-                receive_mode=receive_mode,
+-                name=motor_chain_name,
+-                control_mode=control_mode,
+-                use_buffered_reader=use_buffered_reader,
+-            )
++            self._interface_kwargs.update(bustype="socketcan", receive_mode=receive_mode,
++                                          control_mode=control_mode)
+         else:
+-            self.motor_interface = DMSingleMotorCanInterface(
+-                channel=channel,
+-                bitrate=bitrate,
+-                name=motor_chain_name,
+-                use_buffered_reader=use_buffered_reader,
+-            )
++            self._interface_kwargs.update(bitrate=bitrate)
++        self.motor_interface = DMSingleMotorCanInterface(**self._interface_kwargs)
++        self._close_lock = threading.Lock()
++        self._closed = False
++        self._close_error = None
++        self._transport_closed = False
++        self._control_thread = None
++        self._control_error = None
++        self._disabled_motors = []
++        self._disable_failures = {}
++        self.running = False
++        self._active_chains[channel] = self
+         self.state = None
+         self.state_lock = threading.Lock()
+ 
+@@ -411,6 +423,27 @@
+         self.start_thread_flag = start_thread
+         if start_thread:
+             self.start_thread()
++
++    # Keep ownership even if construction fails after a motor has been enabled.
++    _active_chains = {}
++
++    @classmethod
++    def active_for_channel(cls, channel):
++        return cls._active_chains.get(channel)
++
++    def _check_available(self):
++        if self._control_error is not None:
++            raise RuntimeError("Motor feedback worker failed") from self._control_error
++        if self._closed or not self.running:
++            raise RuntimeError("Stopped motor chain")
++
++    def _run_worker(self):
++        try:
++            self._set_torques_and_update_state()
++        except BaseException as error:
++            self._control_error = error
++            self.running = False
++            logging.exception("Motor feedback worker failed")
+ 
+     def __repr__(self) -> str:
+         return f"DMChainCanInterface(channel={self.channel})"
+@@ -473,11 +506,16 @@
+ 
+     def start_thread(self) -> None:
+         # clean error again for motor with timeout enabled
++        if self._closed or self._transport_closed:
++            raise RuntimeError("Cannot restart a stopped motor chain")
++        if self._control_thread is not None:
++            raise RuntimeError("Motor feedback worker already started")
+         self._motor_on()
+-        thread = threading.Thread(target=self._set_torques_and_update_state)
+-        thread.start()
++        self._control_thread = threading.Thread(target=self._run_worker)
++        self._control_thread.start()
+         time.sleep(0.1)
+         while self.state is None:
++            self._check_available()
+             time.sleep(0.1)
+             logging.info("waiting for the first state")
+ 
+@@ -570,6 +608,7 @@
+         return motor_feedback
+ 
+     def read_states(self, torques: Optional[np.ndarray] = None) -> List[MotorInfo]:
++        self._check_available()
+         motor_infos = []
+         with self.state_lock:
+             for idx in range(len(self.motor_list)):
+@@ -597,6 +636,7 @@
+         kd: Optional[np.ndarray] = None,
+         get_state: bool = True,
+     ) -> List[MotorInfo]:
++        self._check_available()
+         command = []
+         for idx in range(len(self.motor_list)):
+             command.append(
+@@ -617,8 +657,66 @@
+         with self.same_bus_device_lock:
+             return self.same_bus_device_states
+ 
+-    def close(self) -> None:
+-        self.running = False
++    def close(self, disable_motors=True) -> None:
++        """Join the writer before disabling; a probe close only releases its bus.
++
++        Probe ownership remains registered until replaced by the real chain, so
++        interrupted startup can reopen its transport (without enabling motors)
++        and disable only after the follower's support gate authorizes it.
++        """
++        with self._close_lock:
++            # An explicit retry must reissue OFF after joining all writers.
++            self._close_error = None
++            if self._closed:
++                return
++            self.running = False
++            worker = self._control_thread
++            if worker is not None:
++                if worker is threading.current_thread():
++                    raise RuntimeError("Motor worker cannot close itself")
++                if worker.is_alive():
++                    worker.join(timeout=2.0)
++                if worker.is_alive():
++                    raise RuntimeError("Motor worker did not stop; refusing concurrent disable")
++            if not disable_motors:
++                if not self._transport_closed:
++                    self.motor_interface.close()
++                    self._transport_closed = True
++                return
++            failures = {}; self._disabled_motors = []
++            try:
++                if self._transport_closed:
++                    self.motor_interface = DMSingleMotorCanInterface(**self._interface_kwargs)
++                    self._transport_closed = False
++                # Discard old feedback before matching disabled-status ACKs.
++                for _ in range(100):
++                    if self.motor_interface.try_receive_message(timeout=0.001) is None:
++                        break
++                else:
++                    failures['drain'] = 'CAN feedback queue did not drain'
++                for motor_id, _ in self.motor_list:
++                    try:
++                        self.motor_interface.motor_off(motor_id)
++                        self._disabled_motors.append(motor_id)
++                    except Exception as error:
++                        failures[motor_id] = repr(error)
++            except Exception as error:
++                failures['transport'] = repr(error)
++            finally:
++                try:
++                    if not self._transport_closed:
++                        self.motor_interface.close()
++                        self._transport_closed = True
++                except Exception as error:
++                    failures['close'] = repr(error)
++            self._disable_failures = failures
++            if failures:
++                self._close_error = RuntimeError(f"Unverified motor shutdown: {failures}")
++                raise self._close_error
++            self._closed = True
++            if self._active_chains.get(self.channel) is self:
++                self._active_chains.pop(self.channel)
++
+ 
+ 
+ class MultiDMChainCanInterface(MotorChain):
+--- a/i2rt/robots/motor_chain_robot.py
++++ b/i2rt/robots/motor_chain_robot.py
+@@ -59,6 +59,27 @@
+ 
+ class MotorChainRobot(Robot):
+     """A generic Robot protocol."""
++
++    _active_robots = {}
++
++    @classmethod
++    def active_for_channel(cls, channel):
++        return cls._active_robots.get(channel)
++
++    def _check_available(self):
++        if self._server_error is not None:
++            raise RuntimeError("Robot command worker failed") from self._server_error
++        if self._closed or self._stop_event.is_set():
++            raise RuntimeError("Stopped robot")
++        self.motor_chain._check_available()
++
++    def _run_server(self):
++        try:
++            self.start_server()
++        except BaseException as error:
++            self._server_error = error
++            self._stop_event.set()
++            logging.exception("Robot command worker failed")
+ 
+     def __init__(
+         self,
+@@ -84,6 +105,14 @@
+         position_threshold: float = 0.01,  # minimum position change to consider motor still moving (rad)
+         check_interval: float = 0.05,  # time interval between checks (s)
+     ) -> None:
++        # Retain ownership before calibration can fail or be interrupted.
++        self.motor_chain = motor_chain
++        self._close_lock = threading.Lock()
++        self._closed = False
++        self._server_error = None
++        self._server_thread = None
++        self._stop_event = threading.Event()
++        self._active_robots[motor_chain.channel] = self
+         self.temp_record_flag = temp_record_flag
+         if gripper_index is not None:
+             assert gripper_index == len(motor_chain) - 1, (
+@@ -193,8 +222,7 @@
+         # For SWE-454, check if the current qpos is in the joint limits
+         self._check_current_qpos_in_joint_limits()
+ 
+-        self._stop_event = threading.Event()  # Add a stop event
+-        self._server_thread = threading.Thread(target=self.start_server, name="robot_server")
++        self._server_thread = threading.Thread(target=self._run_server, name="robot_server")
+         self._server_thread.start()
+ 
+         if not zero_gravity_mode:
+@@ -407,8 +435,9 @@
+         Returns:
+             T: The current state of the leader robot.
+         """
++        self._check_available()
+         with self._state_lock:
+-            return self._joint_state.pos
++            return self._joint_state.pos.copy()
+ 
+     def _clip_robot_joint_pos_command(self, pos: np.ndarray) -> np.ndarray:
+         """Clip the robot joint pos command to the joint limits. Do not clip the gripper pos.
+@@ -435,6 +464,7 @@
+         Args:
+             joint_pos (np.ndarray): The state to command the leader robot to.
+         """
++        self._check_available()
+         pos = self._clip_robot_joint_pos_command(joint_pos)
+         with self._command_lock:
+             self._commands = JointCommands.init_all_zero(len(self.motor_chain))
+@@ -512,12 +542,24 @@
+             time.sleep(time_interval_s / steps)
+ 
+     def close(self) -> None:
+-        """Safely close the robot by setting all torques to zero."""
+-        # self.move_to_zero()
+-        self._stop_event.set()  # Signal the thread to stop
+-        self._server_thread.join()  # Wait for the thread to finish
+-        self.motor_chain.close()
+-        print("Robot closed with all torques set to zero.")
++        """Stop/join both writers, then require disabled-status ACKs."""
++        with self._close_lock:
++            if self._closed:
++                return
++            self._stop_event.set()
++            worker = self._server_thread
++            if worker is not None:
++                if worker is threading.current_thread():
++                    raise RuntimeError("Robot worker cannot close itself")
++                if worker.is_alive():
++                    worker.join(timeout=2.0)
++                if worker.is_alive():
++                    raise RuntimeError("Robot worker did not stop; refusing motor shutdown")
++            self.motor_chain.close()
++            self._closed = True
++            if self._active_robots.get(self.motor_chain.channel) is self:
++                self._active_robots.pop(self.motor_chain.channel)
++            print("Robot closed; every motor acknowledged disabled status.")
+ 
+     def update_kp_kd(self, kp: np.ndarray, kd: np.ndarray) -> None:
+         assert kp.shape == self._kp.shape == kd.shape
+--- a/i2rt/robots/get_robot.py
++++ b/i2rt/robots/get_robot.py
+@@ -47,6 +47,8 @@
+     joint_limits = np.array([[-2.617, 3.13], [0, 3.65], [0.0, 3.13], [-1.57, 1.57], [-1.57, 1.57], [-2.09, 2.09]])
+     joint_limits[:,0] += -0.15 # add some buffer to the joint limits
+     joint_limits[:,1] += 0.15
++    # This station has a physical +/-90 degree wrist-j4 limit.
++    joint_limits[4] = [-np.pi / 2, np.pi / 2]
+ 
+     motor_directions = [1, 1, 1, 1, 1, 1]
+     # kp = np.array([80, 80, 80, 40, 10, 10])
+@@ -77,7 +79,7 @@
+     )
+     motor_states = motor_chain.read_states()
+     print(f"motor_states: {motor_states}")
+-    motor_chain.close()
++    motor_chain.close(disable_motors=False)
+ 
+     current_pos = [m.pos for m in motor_states]
+     logging.info(f"current_pos: {current_pos}")

@@ -97,14 +97,20 @@ class DashboardUI:
                 server.gui.add_button('Reset view').on_click(lambda _: self.reset_view())
                 self.sim_status=server.gui.add_markdown('Awaiting GELLO mapping.')
             with server.gui.add_folder('Robot control', expand_by_default=False):
-                server.gui.add_markdown('Simulation starts without energizing YAM. **Connect** can energize motors and calibrate the gripper. Return to simulation keeps the robot holding position.')
+                server.gui.add_markdown('Simulation starts without energizing YAM. **Connect** can energize motors and calibrate the gripper. Enable teleop aligns the robot at 0.25 rad/s. Return to simulation keeps the robot holding position.')
+                force=server.gui.add_checkbox('Force feedback during teleop',initial_value=True)
+                force.on_update(lambda event: supervisor.request('haptics_on' if event.target.value else 'haptics_off',event.client_id))
+                self.haptic_status=server.gui.add_markdown('Force feedback waits for teleop; 25 mA motor current cap.')
+                support=server.gui.add_checkbox('Arms supported; grippers clear',initial_value=False)
+                support.on_update(lambda event: supervisor.request('confirm_support' if event.target.value else 'cancel_support',event.client_id))
+                server.gui.add_markdown('Check this immediately before each connection. Startup can leave arms without hold briefly; a failed connection disables torque.')
                 for action,label in [('connect','Connect robot'),('enable','Enable robot teleop'),
                                       ('simulation','Return to simulation'),('recover','Clear fault'),
                                       ('release','Release motors / disconnect (support arms first)')]:
                     button=server.gui.add_button(label, color='red' if action=='release' else None)
                     button.on_click(lambda event, a=action: supervisor.request(a,event.client_id))
                     self.control_buttons[action]=button
-            server.gui.add_markdown('Physical teleop is locked pending driver verification. Details are in Setup.')
+            server.gui.add_markdown('Physical teleop is locked. Details are in Setup.' if PHYSICAL_BLOCKER else 'Connect calibrates the grippers, moves the robot to the saved simulation home pose at 0.25 rad/s, then holds. Enable teleop starts following. Keep GELLO still during alignment.')
         with tabs.add_tab('Cameras'):
             server.gui.add_markdown('Camera previews stream while this tab is open. Capture continues in the background.')
             with server.gui.add_folder('RealSense live streams',expand_by_default=True):
@@ -173,7 +179,7 @@ class DashboardUI:
     def update(self,snapshot):
         now=time.monotonic();self.latest=snapshot
         state=snapshot['control'];mode=state['mode']
-        title={'simulation':'SIMULATION ONLY','holding':'SIMULATION / ROBOT HOLDING','teleop':'PHYSICAL TELEOP ENABLED','fault':'FAULT / TELEOP DISABLED','connecting':'CONNECTING ROBOT'}[mode]
+        title={'simulation':'SIMULATION ONLY','holding':'SIMULATION / ROBOT HOLDING','aligning':'ROBOT ALIGNING','teleop':'PHYSICAL TELEOP ENABLED','fault':'SIMULATION / ROBOT FAULT','connecting':'CONNECTING ROBOT'}[mode]
         self.status.content=f'## {title}\n'+('**DEMO — synthetic simulation motion**\n\n' if self.demo else '')+f'Controller: {state["owner"] or "none"}\n\n'+html.escape(state['error'])
         ready=not PHYSICAL_BLOCKER and bool(self.config.arms) and all(a.calibrated and a.mapping_verified for a in self.config.arms)
         self.control_buttons['connect'].disabled=self.demo or not ready or mode!='simulation'
@@ -182,6 +188,8 @@ class DashboardUI:
         self.control_buttons['recover'].disabled=mode!='fault'
         self.sim_status.content=snapshot['sim_status']+f'\n\nScene: {snapshot.get("scene_rate",0.):.1f} Hz'
         self.setup_status.content=snapshot.get('setup_status',self.setup_status.content)
+        active=[side for side,sample in snapshot['leaders'].items() if sample is not None and now-sample.acquired_at<.2 and sample.raw.get('haptics_active')]
+        self.haptic_status.content='Force feedback active: '+(', '.join(active) or 'none')+' · current cap 25 mA per motor. Reflected motor effort includes gravity and friction.'
         for side in self.leader_text:
             leader=snapshot['leaders'].get(side)
             self.leader_text[side].content=format_arm('GELLO · mapped + raw',leader,now)+'\n'+html.escape(snapshot['errors'].get(side,''))

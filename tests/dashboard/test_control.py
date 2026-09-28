@@ -89,3 +89,95 @@ class ControlTests(unittest.TestCase):
         self.request('release')
         self.assertEqual(self.supervisor.mode,'simulation')
         self.assertEqual(self.supervisor.adapters,{})
+
+    def test_encoder_noise_at_rest_home_is_clipped_to_command_limits(self):
+        from deploy.dashboard.control import checked,HIGH,LOW
+        q=np.array([0.,-.007,0.,1.576,0.,0.,.5])
+        result=checked(ArmSample(self.now,q),self.now)
+        self.assertEqual(result[1],LOW[1])
+        self.assertEqual(result[3],HIGH[3])
+        q[1]=-.02
+        with self.assertRaises(ValueError):checked(ArmSample(self.now,q),self.now)
+
+    def test_physical_connect_requires_fresh_support_confirmation(self):
+        self.supervisor.require_support=True
+        self.request('connect')
+        self.assertEqual(self.created,[])
+        self.request('confirm_support')
+        self.request('connect')
+        self.assertEqual(self.supervisor.mode,'holding')
+        self.request('release')
+        self.request('connect')
+        self.assertEqual(len(self.created),1)
+
+    def test_shutdown_cause_survives_failed_observation(self):
+        self.enable()
+        self.adapter.close=lambda:(_ for _ in ()).throw(RuntimeError('motor 7 lost ACK'))
+        self.request('release')
+        self.adapter.observe=lambda:(_ for _ in ()).throw(RuntimeError('not connected'))
+        self.supervisor.tick(self.now)
+        self.assertIn('motor 7 lost ACK',self.supervisor.error)
+
+    def test_enable_from_different_pose_aligns_gradually_without_jump(self):
+        self.request('connect')
+        goal=self.adapter.q.copy();goal[0]+=.8;self.publish(goal)
+        before=self.adapter.q.copy()
+        self.request('enable')
+        self.assertEqual(self.supervisor.mode,'aligning')
+        np.testing.assert_allclose(self.adapter.commands[-1],before)
+        self.now+=.1;self.publish(goal);self.supervisor.heartbeat('a',self.now)
+        self.supervisor.tick(self.now)
+        self.assertGreater(self.adapter.commands[-1][0],before[0])
+        self.assertLessEqual(self.adapter.commands[-1][0]-before[0],.025001)
+        self.now+=.501;self.publish(goal);self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'holding')
+
+    def test_alignment_enters_teleop_only_after_robot_reaches_leader(self):
+        self.request('connect')
+        goal=self.adapter.q.copy();goal[0]+=.5;self.publish(goal);self.request('enable')
+        self.assertEqual(self.supervisor.mode,'aligning')
+        for _ in range(30):
+            self.now+=.1;self.adapter.q=self.adapter.commands[-1].copy()
+            self.publish(goal);self.supervisor.heartbeat('a',self.now);self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'teleop')
+        np.testing.assert_allclose(self.adapter.commands[-1],goal)
+
+    def test_moving_leader_during_alignment_stops_motion(self):
+        self.request('connect');goal=self.adapter.q.copy();goal[0]+=.8
+        self.publish(goal);self.request('enable');self.now+=.1
+        goal[0]+=.1;self.publish(goal);self.supervisor.heartbeat('a',self.now)
+        self.supervisor.tick(self.now)
+        self.assertEqual(self.supervisor.mode,'holding')
+        self.assertIn('Keep GELLO still',self.supervisor.error)
+
+    def test_connect_stays_holding_if_browser_not_ready_for_home_move(self):
+        self.supervisor.home_on_connect=True
+        self.supervisor._heartbeats.clear()
+        self.request('connect')
+        self.assertEqual(self.supervisor.mode,'holding')
+        self.assertFalse(self.adapter.closed)
+
+    def test_force_feedback_only_has_live_targets_during_teleop(self):
+        commands=LatestSample()
+        self.supervisor.haptics={'left':commands}
+        self.adapter.observe=lambda:ArmSample(self.now,self.adapter.q.copy(),effort=np.ones(7),raw={'gripper_direction':-1})
+        self.request('connect');self.assertFalse(commands.read().enabled)
+        self.request('enable');self.assertTrue(commands.read().enabled)
+        self.request('simulation');self.assertFalse(commands.read().enabled)
+
+    def test_connect_uses_saved_home_not_current_leader_pose(self):
+        self.supervisor.home_on_connect=True
+        home=np.array([0.,0.,0.,1.5708,0.,0.,.5])
+        self.supervisor.home_pose=home
+        self.request('connect')
+        np.testing.assert_allclose(self.supervisor._alignment_goals['left'],np.clip(home,[-2.617,0,0,-1.57,-1.57,-2.09,0],[3.13,3.65,3.13,1.57,1.57,2.09,1]))
+        self.assertEqual(self.supervisor._alignment_then,'holding')
+
+    def test_haptic_publication_preserves_feedback_age(self):
+        commands=LatestSample();self.supervisor.haptics={'left':commands}
+        self.supervisor.mode='teleop'
+        self.supervisor.observations={'left':ArmSample(self.now-.09,self.adapter.q.copy(),effort=np.ones(7),raw={'gripper_direction':-1})}
+        self.supervisor._publish()
+        self.assertTrue(commands.read().enabled)
+        self.assertAlmostEqual(commands.read().acquired_at,self.now-.09)
+        self.assertGreater(self.now+.02-commands.read().acquired_at,.1)
